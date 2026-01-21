@@ -1,339 +1,236 @@
-import { bench, describe, beforeAll } from 'vitest'
+import { bench, describe } from 'vitest'
 
 /**
- * Colo (Colocation) Benchmarks
+ * Colo (Colocation) Benchmarks - REAL Network Latency
  *
- * Measures latency differences based on geographic colocation of Workers and DOs.
+ * Measures actual round-trip latency to colo.do endpoints in different datacenters.
  *
- * Key concepts:
- * - Same colo: Worker and DO in same datacenter (optimal)
- * - Cross-colo: Worker in one region, DO in another (adds RTT)
- * - DO placement: Determined by first request origin or locationHint
- *
- * Real-world RTT estimates (for simulation):
- * - Same colo: ~0.1-0.5ms
- * - Same continent: ~20-50ms
- * - Cross-continent: ~100-200ms
- * - Global (antipodal): ~150-300ms
- *
- * Note: Actual multi-region testing requires deployed Workers.
- * These benchmarks use simulation helpers to model cross-colo latency.
+ * Available colo.do endpoints:
+ * - ord.colo.do - Chicago (ORD)
+ * - iad.colo.do - Virginia (IAD)
+ * - lhr.colo.do - London (LHR)
+ * - ams.colo.do - Amsterdam (AMS)
+ * - sin.colo.do - Singapore (SIN)
+ * - syd.colo.do - Sydney (SYD)
+ * - nrt.colo.do - Tokyo (NRT)
+ * - lax.colo.do - Los Angeles (LAX)
+ * - dfw.colo.do - Dallas (DFW)
  */
 
-// Simulated RTT values in milliseconds
-const RTT = {
-  SAME_COLO: 0.3,          // Same datacenter
-  SAME_REGION: 5,           // Same region, different colo
-  SAME_CONTINENT: 30,       // e.g., LAX to ORD
-  CROSS_CONTINENT: 120,     // e.g., LAX to AMS
-  ANTIPODAL: 200,           // e.g., NYC to Sydney
-} as const
-
-// Cloudflare colo codes for documentation
+// Colo endpoints with their locations
 const COLOS = {
-  // North America
-  SJC: 'San Jose',
-  LAX: 'Los Angeles',
-  SEA: 'Seattle',
-  ORD: 'Chicago',
-  IAD: 'Washington DC',
-  EWR: 'Newark',
-  ATL: 'Atlanta',
-  DFW: 'Dallas',
-  // Europe
-  AMS: 'Amsterdam',
-  LHR: 'London',
-  FRA: 'Frankfurt',
-  CDG: 'Paris',
-  // Asia Pacific
-  NRT: 'Tokyo',
-  SIN: 'Singapore',
-  SYD: 'Sydney',
-  HKG: 'Hong Kong',
+  ord: 'Chicago',
+  iad: 'Virginia',
+  lhr: 'London',
+  ams: 'Amsterdam',
+  sin: 'Singapore',
+  syd: 'Sydney',
+  nrt: 'Tokyo',
+  lax: 'Los Angeles',
+  dfw: 'Dallas',
 } as const
 
+type ColoCode = keyof typeof COLOS
+
 /**
- * Simulation helper: adds artificial latency to model cross-colo access
+ * Measure latency to a specific colo endpoint
  */
-async function simulateRTT(ms: number): Promise<void> {
-  if (ms > 0) {
-    await new Promise(resolve => setTimeout(resolve, ms))
-  }
+async function measureColoLatency(colo: ColoCode): Promise<number> {
+  const start = performance.now()
+  await fetch(`https://${colo}.colo.do/ping`)
+  return performance.now() - start
 }
 
 /**
- * Simulation helper: models a DO stub.fetch() with network latency
+ * Find the closest colo by measuring RTT to all endpoints
  */
-async function simulateDOFetch(
-  operation: () => Promise<any>,
-  rtt: number = RTT.SAME_COLO
-): Promise<any> {
-  // RTT is round-trip, so we split: request travel + operation + response travel
-  await simulateRTT(rtt / 2)
-  const result = await operation()
-  await simulateRTT(rtt / 2)
-  return result
-}
+async function findClosestColo(): Promise<{ colo: ColoCode; latency: number; all: Record<ColoCode, number> }> {
+  const results: Record<string, number> = {}
 
-/**
- * Mock DO storage operations for benchmarking
- */
-class MockDOStorage {
-  private data = new Map<string, any>()
-
-  async get(key: string): Promise<any> {
-    // Simulate local SQLite read (~0.05ms)
-    return this.data.get(key)
-  }
-
-  async put(key: string, value: any): Promise<void> {
-    // Simulate local SQLite write (~0.1ms)
-    this.data.set(key, value)
-  }
-
-  async list(options?: { prefix?: string; limit?: number }): Promise<Map<string, any>> {
-    const result = new Map<string, any>()
-    let count = 0
-    for (const [key, value] of this.data) {
-      if (options?.prefix && !key.startsWith(options.prefix)) continue
-      result.set(key, value)
-      count++
-      if (options?.limit && count >= options.limit) break
-    }
-    return result
-  }
-
-  async sql(query: string, params?: any[]): Promise<any[]> {
-    // Simulate SQL execution (~0.1-1ms depending on query)
-    return []
-  }
-}
-
-/**
- * Mock DO instance for benchmarking
- */
-class MockDO {
-  storage: MockDOStorage
-  id: string
-  colo: keyof typeof COLOS
-
-  constructor(id: string, colo: keyof typeof COLOS = 'SJC') {
-    this.id = id
-    this.colo = colo
-    this.storage = new MockDOStorage()
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    // Simulate request handling
-    const url = new URL(request.url)
-    const path = url.pathname
-
-    if (path === '/health') {
-      return new Response(JSON.stringify({ status: 'ok', colo: this.colo }))
-    }
-
-    if (path.startsWith('/things/')) {
-      const id = path.split('/')[2]
-      const thing = await this.storage.get(`thing:${id}`)
-      return new Response(JSON.stringify(thing || null))
-    }
-
-    return new Response(JSON.stringify({ colo: this.colo }))
-  }
-}
-
-// Initialize mock instances
-let localDO: MockDO
-let remoteDOs: Map<keyof typeof COLOS, MockDO>
-
-beforeAll(async () => {
-  localDO = new MockDO('local-do', 'SJC')
-
-  // Pre-populate with test data
-  for (let i = 0; i < 1000; i++) {
-    await localDO.storage.put(`thing:thing-${i.toString().padStart(4, '0')}`, {
-      id: `thing-${i.toString().padStart(4, '0')}`,
-      name: `Thing ${i}`,
-      status: i % 2 === 0 ? 'active' : 'inactive',
-      createdAt: Date.now() - i * 1000,
+  // Measure all colos in parallel
+  const measurements = await Promise.all(
+    Object.keys(COLOS).map(async (colo) => {
+      const latency = await measureColoLatency(colo as ColoCode)
+      return { colo: colo as ColoCode, latency }
     })
-  }
+  )
 
-  // Create DOs in different colos for cross-region simulation
-  remoteDOs = new Map([
-    ['LAX', new MockDO('do-lax', 'LAX')],
-    ['ORD', new MockDO('do-ord', 'ORD')],
-    ['AMS', new MockDO('do-ams', 'AMS')],
-    ['NRT', new MockDO('do-nrt', 'NRT')],
-    ['SYD', new MockDO('do-syd', 'SYD')],
-  ])
+  let closest: { colo: ColoCode; latency: number } = { colo: 'ord', latency: Infinity }
 
-  // Populate remote DOs
-  for (const [, do_] of remoteDOs) {
-    for (let i = 0; i < 100; i++) {
-      await do_.storage.put(`thing:thing-${i.toString().padStart(4, '0')}`, {
-        id: `thing-${i.toString().padStart(4, '0')}`,
-        name: `Thing ${i}`,
-      })
+  for (const { colo, latency } of measurements) {
+    results[colo] = latency
+    if (latency < closest.latency) {
+      closest = { colo, latency }
     }
   }
-})
+
+  return { ...closest, all: results as Record<ColoCode, number> }
+}
 
 // =============================================================================
-// Same Datacenter Benchmarks
+// Real Cross-Region Latency Benchmarks
 // =============================================================================
 
-describe('Colo - Same Datacenter', () => {
+describe('Colo - Real Cross-Region Latency', () => {
   /**
-   * Baseline: Worker and DO in same colo
-   * This is the optimal scenario with minimal network latency
+   * Measure actual RTT to each colo.do endpoint.
+   * Results will vary based on your location.
    */
 
-  bench('local DO access (fetch)', async () => {
-    await simulateDOFetch(async () => {
-      return localDO.fetch(new Request('https://do/health'))
-    }, RTT.SAME_COLO)
+  bench('ORD (Chicago)', async () => {
+    await fetch('https://ord.colo.do/ping')
   })
 
-  bench('local storage.get (single key)', async () => {
-    await simulateDOFetch(async () => {
-      return localDO.storage.get('thing:thing-0001')
-    }, RTT.SAME_COLO)
+  bench('IAD (Virginia)', async () => {
+    await fetch('https://iad.colo.do/ping')
   })
 
-  bench('local storage.get (10 sequential)', async () => {
-    await simulateDOFetch(async () => {
-      const results = []
-      for (let i = 0; i < 10; i++) {
-        results.push(await localDO.storage.get(`thing:thing-${i.toString().padStart(4, '0')}`))
-      }
-      return results
-    }, RTT.SAME_COLO)
+  bench('LHR (London)', async () => {
+    await fetch('https://lhr.colo.do/ping')
   })
 
-  bench('local storage.list (100 items)', async () => {
-    await simulateDOFetch(async () => {
-      return localDO.storage.list({ prefix: 'thing:', limit: 100 })
-    }, RTT.SAME_COLO)
+  bench('AMS (Amsterdam)', async () => {
+    await fetch('https://ams.colo.do/ping')
   })
 
-  bench('local sql.exec (simple query)', async () => {
-    await simulateDOFetch(async () => {
-      return localDO.storage.sql('SELECT * FROM things WHERE id = ?', ['thing-0001'])
-    }, RTT.SAME_COLO)
+  bench('SIN (Singapore)', async () => {
+    await fetch('https://sin.colo.do/ping')
   })
 
-  bench('local sql.exec (range query)', async () => {
-    await simulateDOFetch(async () => {
-      return localDO.storage.sql(
-        'SELECT * FROM things WHERE status = ? LIMIT 100',
-        ['active']
-      )
-    }, RTT.SAME_COLO)
+  bench('SYD (Sydney)', async () => {
+    await fetch('https://syd.colo.do/ping')
+  })
+
+  bench('NRT (Tokyo)', async () => {
+    await fetch('https://nrt.colo.do/ping')
+  })
+
+  bench('LAX (Los Angeles)', async () => {
+    await fetch('https://lax.colo.do/ping')
+  })
+
+  bench('DFW (Dallas)', async () => {
+    await fetch('https://dfw.colo.do/ping')
   })
 })
 
 // =============================================================================
-// Cross-Region Benchmarks (Simulated)
+// Closest Colo Discovery
 // =============================================================================
 
-describe('Colo - Cross-Region (simulated)', () => {
+describe('Colo - Closest Colo Discovery', () => {
   /**
-   * These benchmarks simulate the latency impact of accessing a DO
-   * that is located in a different region than the Worker handling the request.
-   *
-   * Real-world scenario: User in Europe hits a Worker in AMS,
-   * but their DO was created and pinned to SJC.
+   * Discover which colo is closest by measuring RTT to all endpoints.
+   * This is useful for determining optimal DO placement.
    */
 
-  bench('same-region DO access (~5ms RTT)', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('LAX')!.fetch(new Request('https://do/health'))
-    }, RTT.SAME_REGION)
+  bench('find closest colo (parallel measurement)', async () => {
+    await findClosestColo()
   })
 
-  bench('same-continent DO access (~30ms RTT)', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('ORD')!.fetch(new Request('https://do/health'))
-    }, RTT.SAME_CONTINENT)
-  })
-
-  bench('cross-continent DO access (~120ms RTT)', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('AMS')!.fetch(new Request('https://do/health'))
-    }, RTT.CROSS_CONTINENT)
-  })
-
-  bench('antipodal DO access (~200ms RTT)', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('SYD')!.fetch(new Request('https://do/health'))
-    }, RTT.ANTIPODAL)
-  })
-
-  bench('cross-continent with storage.get', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('AMS')!.storage.get('thing:thing-0001')
-    }, RTT.CROSS_CONTINENT)
-  })
-
-  bench('antipodal with storage.list (100 items)', async () => {
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('SYD')!.storage.list({ prefix: 'thing:', limit: 100 })
-    }, RTT.ANTIPODAL)
+  bench('measure single colo (baseline)', async () => {
+    await measureColoLatency('ord')
   })
 })
 
 // =============================================================================
-// RTT Impact Analysis
+// Sequential vs Parallel Fetch Comparison
 // =============================================================================
 
-describe('Colo - RTT Impact on Operations', () => {
+describe('Colo - Sequential vs Parallel Fetches', () => {
   /**
-   * Demonstrates how RTT compounds with multiple DO calls.
-   * Key insight: Batch operations or DO-side logic reduces RTT impact.
+   * Compare the performance of sequential vs parallel fetches to multiple colos.
+   * Demonstrates the importance of parallelization for multi-region operations.
    */
 
-  bench('1 DO call (same colo)', async () => {
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), RTT.SAME_COLO)
+  bench('3 colos sequential (ORD, IAD, LHR)', async () => {
+    await fetch('https://ord.colo.do/ping')
+    await fetch('https://iad.colo.do/ping')
+    await fetch('https://lhr.colo.do/ping')
   })
 
-  bench('1 DO call (cross-continent)', async () => {
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), RTT.CROSS_CONTINENT)
+  bench('3 colos parallel (ORD, IAD, LHR)', async () => {
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://iad.colo.do/ping'),
+      fetch('https://lhr.colo.do/ping'),
+    ])
   })
 
-  bench('5 sequential DO calls (same colo)', async () => {
-    for (let i = 0; i < 5; i++) {
-      await simulateDOFetch(async () => localDO.storage.get(`thing:thing-000${i}`), RTT.SAME_COLO)
+  bench('5 colos sequential (US + EU)', async () => {
+    await fetch('https://ord.colo.do/ping')
+    await fetch('https://iad.colo.do/ping')
+    await fetch('https://lax.colo.do/ping')
+    await fetch('https://lhr.colo.do/ping')
+    await fetch('https://ams.colo.do/ping')
+  })
+
+  bench('5 colos parallel (US + EU)', async () => {
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://iad.colo.do/ping'),
+      fetch('https://lax.colo.do/ping'),
+      fetch('https://lhr.colo.do/ping'),
+      fetch('https://ams.colo.do/ping'),
+    ])
+  })
+
+  bench('all 9 colos sequential', async () => {
+    for (const colo of Object.keys(COLOS)) {
+      await fetch(`https://${colo}.colo.do/ping`)
     }
   })
 
-  bench('5 sequential DO calls (cross-continent)', async () => {
-    // This shows the pain of chatty protocols across regions
-    // 5 calls * 120ms RTT = 600ms minimum
-    for (let i = 0; i < 5; i++) {
-      await simulateDOFetch(async () => localDO.storage.get(`thing:thing-000${i}`), RTT.CROSS_CONTINENT)
-    }
-  })
-
-  bench('5 batched DO calls (cross-continent)', async () => {
-    // Single round-trip with batched operation
-    await simulateDOFetch(async () => {
-      const results = []
-      for (let i = 0; i < 5; i++) {
-        results.push(await localDO.storage.get(`thing:thing-000${i}`))
-      }
-      return results
-    }, RTT.CROSS_CONTINENT)
+  bench('all 9 colos parallel', async () => {
+    await Promise.all(
+      Object.keys(COLOS).map(colo => fetch(`https://${colo}.colo.do/ping`))
+    )
   })
 })
 
 // =============================================================================
-// Distribution Patterns
+// Regional Grouping Benchmarks
+// =============================================================================
+
+describe('Colo - Regional Groups', () => {
+  /**
+   * Measure latency to regional groups of colos.
+   * Useful for understanding regional latency characteristics.
+   */
+
+  bench('US colos parallel (ORD, IAD, LAX, DFW)', async () => {
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://iad.colo.do/ping'),
+      fetch('https://lax.colo.do/ping'),
+      fetch('https://dfw.colo.do/ping'),
+    ])
+  })
+
+  bench('EU colos parallel (LHR, AMS)', async () => {
+    await Promise.all([
+      fetch('https://lhr.colo.do/ping'),
+      fetch('https://ams.colo.do/ping'),
+    ])
+  })
+
+  bench('APAC colos parallel (SIN, SYD, NRT)', async () => {
+    await Promise.all([
+      fetch('https://sin.colo.do/ping'),
+      fetch('https://syd.colo.do/ping'),
+      fetch('https://nrt.colo.do/ping'),
+    ])
+  })
+})
+
+// =============================================================================
+// Distribution Pattern Benchmarks (Real Fetches)
 // =============================================================================
 
 describe('Colo - Distribution Patterns', () => {
   /**
    * Different DO distribution patterns have different latency characteristics.
+   * These benchmarks use real fetches to demonstrate the patterns.
    *
    * 1. DO per-user: User's DO is pinned to their first-request location
    *    - Pro: Always local for that user
@@ -343,201 +240,152 @@ describe('Colo - Distribution Patterns', () => {
    *    - Pro: Consistent state, easier to manage
    *    - Con: Some users will always have high latency
    *
-   * 3. Global singleton: One DO for entire app
-   *    - Pro: Simplest model, strong consistency
-   *    - Con: Worst-case latency for most users
+   * 3. Regional hub: One DO per major region
+   *    - Pro: Good balance of latency and consistency
+   *    - Con: More complex to manage
    */
 
-  bench('DO per-user pattern (user local)', async () => {
-    // User's DO is in their local colo - best case
-    const userId = 'user-001'
-    await simulateDOFetch(async () => {
-      return localDO.storage.get(`user:${userId}:profile`)
-    }, RTT.SAME_COLO)
+  bench('single region access (closest colo)', async () => {
+    // Simulate accessing a DO in your closest colo
+    // In production, you'd use findClosestColo() to determine this
+    await fetch('https://ord.colo.do/ping')
   })
 
-  bench('DO per-user pattern (user traveling)', async () => {
-    // User's DO is pinned to home region, but they're traveling
-    // Simulates: User DO in SJC, user now in Europe
-    const userId = 'user-001'
-    await simulateDOFetch(async () => {
-      return localDO.storage.get(`user:${userId}:profile`)
-    }, RTT.CROSS_CONTINENT)
+  bench('cross-continent access (US to EU)', async () => {
+    // Simulate a US user accessing a DO pinned in EU
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),  // Local worker
+      fetch('https://lhr.colo.do/ping'),  // Remote DO
+    ])
   })
 
-  bench('DO per-tenant pattern (tenant local)', async () => {
-    // Company's DO is in SF, employee in SF
-    const tenantId = 'acme-corp'
-    await simulateDOFetch(async () => {
-      return localDO.storage.get(`tenant:${tenantId}:settings`)
-    }, RTT.SAME_COLO)
+  bench('cross-continent access (US to APAC)', async () => {
+    // Simulate a US user accessing a DO pinned in APAC
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),  // Local worker
+      fetch('https://nrt.colo.do/ping'),  // Remote DO
+    ])
   })
 
-  bench('DO per-tenant pattern (employee remote)', async () => {
-    // Company's DO is in SF, employee in Europe
-    const tenantId = 'acme-corp'
-    await simulateDOFetch(async () => {
-      return localDO.storage.get(`tenant:${tenantId}:settings`)
-    }, RTT.CROSS_CONTINENT)
+  bench('regional hub pattern - US hub', async () => {
+    // Access US regional hub from multiple US locations
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://iad.colo.do/ping'),
+      fetch('https://lax.colo.do/ping'),
+    ])
   })
 
-  bench('global singleton DO (local user)', async () => {
-    // Global config DO, accessed by local user
-    await simulateDOFetch(async () => {
-      return localDO.storage.get('global:config')
-    }, RTT.SAME_COLO)
-  })
-
-  bench('global singleton DO (remote user)', async () => {
-    // Global config DO in US, accessed from Australia
-    await simulateDOFetch(async () => {
-      return localDO.storage.get('global:config')
-    }, RTT.ANTIPODAL)
+  bench('regional hub pattern - global hubs', async () => {
+    // Access all regional hubs in parallel
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),  // US hub
+      fetch('https://lhr.colo.do/ping'),  // EU hub
+      fetch('https://nrt.colo.do/ping'),  // APAC hub
+    ])
   })
 })
 
 // =============================================================================
-// Location Hint Strategies
+// Repeated Request Benchmarks (Connection Reuse)
 // =============================================================================
 
-describe('Colo - Location Hint Strategies', () => {
+describe('Colo - Connection Reuse', () => {
   /**
-   * DO placement strategies using idFromName vs locationHint
-   *
-   * idFromName: DO placed where first request originated
-   * locationHint: Explicitly specify desired colo
-   *
-   * Use locationHint when:
-   * - You know user's primary region
-   * - You want to colocate with other services
-   * - You're optimizing for specific user segments
+   * Measure the impact of connection reuse on latency.
+   * HTTP/2 and keep-alive can significantly reduce subsequent request latency.
    */
 
-  bench('idFromName (natural placement)', async () => {
-    // DO created based on first request origin
-    // Simulates: First request came from local region
-    await simulateDOFetch(async () => {
-      return localDO.fetch(new Request('https://do/things/thing-0001'))
-    }, RTT.SAME_COLO)
+  bench('5 sequential requests to same colo', async () => {
+    for (let i = 0; i < 5; i++) {
+      await fetch('https://ord.colo.do/ping')
+    }
   })
 
-  bench('locationHint: same region', async () => {
-    // Explicitly placed in user's region
-    await simulateDOFetch(async () => {
-      return localDO.fetch(new Request('https://do/things/thing-0001'))
-    }, RTT.SAME_COLO)
+  bench('5 parallel requests to same colo', async () => {
+    await Promise.all([
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://ord.colo.do/ping'),
+      fetch('https://ord.colo.do/ping'),
+    ])
   })
 
-  bench('locationHint: wrong region', async () => {
-    // Explicitly placed in wrong region (e.g., compliance requirement)
-    // Simulates: User in Australia, DO must be in EU for GDPR
-    await simulateDOFetch(async () => {
-      return remoteDOs.get('AMS')!.fetch(new Request('https://do/things/thing-0001'))
-    }, RTT.ANTIPODAL)
+  bench('10 sequential requests to same colo', async () => {
+    for (let i = 0; i < 10; i++) {
+      await fetch('https://ord.colo.do/ping')
+    }
   })
 
-  bench('locationHint: regional hub strategy', async () => {
-    // Use regional hubs (e.g., one DO per continent)
-    // Simulates: US West user accessing US regional hub
-    await simulateDOFetch(async () => {
-      return localDO.fetch(new Request('https://do/things/thing-0001'))
-    }, RTT.SAME_REGION)
+  bench('10 parallel requests to same colo', async () => {
+    await Promise.all(
+      Array.from({ length: 10 }, () => fetch('https://ord.colo.do/ping'))
+    )
   })
 })
 
 // =============================================================================
-// P50/P95/P99 Latency Estimation
+// Latency Consistency Benchmarks
 // =============================================================================
 
-describe('Colo - Latency Percentile Simulation', () => {
+describe('Colo - Latency Consistency', () => {
   /**
-   * Simulates latency distribution for different scenarios.
-   * Real percentiles would require deployed Workers with actual measurements.
-   *
-   * Typical distribution factors:
-   * - Base RTT variance: +/- 20%
-   * - Congestion spikes: 2-5x normal
-   * - Packet loss/retransmit: adds 1 RTT
+   * Measure latency consistency over multiple requests.
+   * Real-world latency varies due to network conditions, congestion, etc.
    */
 
-  bench('P50 latency simulation (same colo)', async () => {
-    // P50 = median, typical case
-    const variance = 0.2
-    const latency = RTT.SAME_COLO * (1 + (Math.random() - 0.5) * variance)
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
+  bench('ORD consistency (single request)', async () => {
+    await fetch('https://ord.colo.do/ping')
   })
 
-  bench('P95 latency simulation (same colo)', async () => {
-    // P95 = 95th percentile, occasional spike
-    const spike = 2
-    const latency = RTT.SAME_COLO * spike
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
+  bench('LHR consistency (single request)', async () => {
+    await fetch('https://lhr.colo.do/ping')
   })
 
-  bench('P99 latency simulation (same colo)', async () => {
-    // P99 = 99th percentile, rare spike (congestion, retransmit)
-    const spike = 5
-    const latency = RTT.SAME_COLO * spike
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
+  bench('NRT consistency (single request)', async () => {
+    await fetch('https://nrt.colo.do/ping')
   })
 
-  bench('P50 latency simulation (cross-continent)', async () => {
-    const variance = 0.2
-    const latency = RTT.CROSS_CONTINENT * (1 + (Math.random() - 0.5) * variance)
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
-  })
-
-  bench('P95 latency simulation (cross-continent)', async () => {
-    const spike = 2
-    const latency = RTT.CROSS_CONTINENT * spike
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
-  })
-
-  bench('P99 latency simulation (cross-continent)', async () => {
-    const spike = 3 // Less dramatic spike at higher base latency
-    const latency = RTT.CROSS_CONTINENT * spike
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), latency)
+  bench('SYD consistency (single request)', async () => {
+    await fetch('https://syd.colo.do/ping')
   })
 })
 
 // =============================================================================
-// Optimization Strategies
+// Real-World Scenario Benchmarks
 // =============================================================================
 
-describe('Colo - Optimization Strategies', () => {
+describe('Colo - Real-World Scenarios', () => {
   /**
-   * Strategies to minimize cross-colo latency impact
+   * Simulate real-world access patterns with actual network requests.
    */
 
-  bench('eager DO migration (simulated)', async () => {
-    // Concept: Migrate DO closer to where requests are coming from
-    // After migration, access becomes local
-    // Note: DO migration is not currently supported by Cloudflare
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), RTT.SAME_COLO)
+  bench('API gateway pattern (route to closest)', async () => {
+    // Simulate an API gateway that routes to the closest colo
+    const { colo } = await findClosestColo()
+    await fetch(`https://${colo}.colo.do/ping`)
   })
 
-  bench('read replica pattern (simulated)', async () => {
-    // Concept: Read from local replica, write to primary
-    // Read is fast (local), write adds latency
-    // Note: This would require custom implementation
-    await simulateDOFetch(async () => localDO.storage.get('thing:thing-0001'), RTT.SAME_COLO)
+  bench('multi-region read (fan-out to 3 regions)', async () => {
+    // Read from multiple regions and use fastest response
+    const results = await Promise.all([
+      fetch('https://ord.colo.do/ping').then(r => ({ region: 'ord', response: r })),
+      fetch('https://lhr.colo.do/ping').then(r => ({ region: 'lhr', response: r })),
+      fetch('https://nrt.colo.do/ping').then(r => ({ region: 'nrt', response: r })),
+    ])
+    // In real scenario, you'd use the first response
+    return results
   })
 
-  bench('write-through cache (KV)', async () => {
-    // Use KV as globally replicated cache in front of DO
-    // KV read is local, DO write is async
-    await simulateRTT(1) // KV read latency ~1ms
+  bench('primary-secondary pattern (write to primary, read from secondary)', async () => {
+    // Write to primary (ORD), then read from secondary (IAD)
+    await fetch('https://ord.colo.do/ping')  // Primary write
+    await fetch('https://iad.colo.do/ping')  // Secondary read
   })
 
-  bench('edge cache (Cache API)', async () => {
-    // Cache frequently accessed DO data at edge
-    // Cache hit is instant, miss goes to DO
-    await simulateRTT(0.1) // Cache hit latency
-  })
-
-  bench('predictive prefetch', async () => {
-    // Prefetch likely-needed data during idle time
-    // When user needs it, it's already in local cache
-    await simulateRTT(0.1) // Already in local memory
+  bench('global singleton (fixed location)', async () => {
+    // All requests go to a single global DO location
+    await fetch('https://ord.colo.do/ping')
   })
 })
