@@ -1,0 +1,41 @@
+{
+  "name": "@dotdo/bench",
+  "version": "0.1.0",
+  "description": "Performance and cost benchmarks for dotdo database backends",
+  "type": "module",
+  "scripts": {
+    "bench": "vitest bench",
+    "bench:run": "vitest bench --run",
+    "bench:cold": "vitest bench --run benchmarks/cold-start.bench.ts",
+    "bench:warm": "vitest bench --run benchmarks/warm-query.bench.ts",
+    "bench:hot": "vitest bench --run benchmarks/hot-cache.bench.ts",
+    "bench:worker-do": "vitest bench --run benchmarks/worker-vs-do.bench.ts",
+    "bench:colo": "vitest bench --run benchmarks/colo.bench.ts",
+    "bench:bundle": "node scripts/measure-bundles.js",
+    "bench:cost": "node scripts/calculate-costs.js",
+    "bench:all": "pnpm bench:bundle && pnpm bench:run && pnpm bench:cost",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20250121.0",
+    "esbuild": "^0.24.0",
+    "gzip-size": "^7.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0",
+    "wrangler": "^3.100.0"
+  },
+  "dependencies": {
+    "hono": "^4.7.0"
+  },
+  "optionalPeerDependencies": {
+    "@dotdo/db4": "Optional database backend",
+    "@dotdo/evodb": "Optional database backend",
+    "@dotdo/postgres": "Optional database backend",
+    "@dotdo/sqlite": "Optional database backend",
+    "@dotdo/duckdb": "Optional database backend"
+  }
+}
