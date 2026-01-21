@@ -163,21 +163,19 @@ function main() {
       description: 'Shreds JSON to columns, packs into 2MB blocks',
     },
     postgres: {
-      strategy: 'Page-level VFS (8KB pages)',
-      blobPacking: false,
-      description: 'Uses PostgreSQL 8KB pages, not optimized for DO pricing',
-      note: 'Could be improved with custom VFS using 2MB chunks',
+      strategy: 'VFS with 2MB chunks (512 × 8KB pages)',
+      blobPacking: true,
+      description: 'Packs 512 PostgreSQL pages into 2MB DO blobs',
     },
     sqlite: {
-      strategy: 'Page-level VFS (4KB pages)',
-      blobPacking: false,
-      description: 'Uses SQLite 4KB pages, not optimized for DO pricing',
-      note: 'Could be improved with custom VFS using 2MB chunks',
+      strategy: 'VFS with 2MB chunks (512 × 4KB pages)',
+      blobPacking: true,
+      description: 'Packs 512 SQLite pages into 2MB DO blobs',
     },
     duckdb: {
-      strategy: 'Buffer registration (variable)',
-      blobPacking: 'partial',
-      description: 'Registers Parquet buffers, benefits from columnar format',
+      strategy: 'Buffer registration (2MB chunks)',
+      blobPacking: true,
+      description: 'Registers buffers as 2MB blobs, columnar format',
     },
   }
 
