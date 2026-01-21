@@ -11,8 +11,13 @@
     "bench:hot": "vitest bench --run benchmarks/hot-cache.bench.ts",
     "bench:worker-do": "vitest bench --run benchmarks/worker-vs-do.bench.ts",
     "bench:colo": "vitest bench --run benchmarks/colo.bench.ts",
+    "bench:mongo": "vitest bench --run databases/mongo.bench.ts",
+    "bench:graph": "vitest bench --run benchmarks/graph.bench.ts",
+    "bench:financial": "vitest bench --run benchmarks/financial.bench.ts",
+    "bench:financial:simulated": "TIGERBEETLE_SIMULATED=true vitest bench --run benchmarks/financial.bench.ts",
     "bench:bundle": "node scripts/measure-bundles.js",
     "bench:cost": "node scripts/calculate-costs.js",
+    "bench:vfs": "vitest bench --run benchmarks/vfs-cost.bench.ts",
     "bench:all": "pnpm bench:bundle && pnpm bench:run && pnpm bench:cost",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
@@ -29,6 +34,7 @@
     "wrangler": "^3.100.0"
   },
   "dependencies": {
+    "@dotdo/poc-tigerbeetle-do": "file:../pocs/packages/tigerbeetle-do",
     "hono": "^4.7.0"
   },
   "optionalPeerDependencies": {
@@ -36,6 +42,11 @@
     "@dotdo/evodb": "Optional database backend",
     "@dotdo/postgres": "Optional database backend",
     "@dotdo/sqlite": "Optional database backend",
-    "@dotdo/duckdb": "Optional database backend"
+    "@dotdo/duckdb": "Optional database backend",
+    "@db4/mongo": "MongoDB API on db4 backend (pure TypeScript, zero WASM)",
+    "@dotdo/mongodb": "MongoDB API on PostgreSQL/DocumentDB backend (PGLite WASM)",
+    "tigerbeetle-node": "TigerBeetle native client for financial benchmarks (requires TigerBeetle cluster)",
+    "@dotdo/graphdb": "Graph database with triple store, WebSocket hibernation, and R2 lakehouse",
+    "@dotdo/sdb": "Document/graph database with schema-based documents and WebSocket subscriptions"
   }
 }

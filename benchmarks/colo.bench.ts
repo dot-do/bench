@@ -369,13 +369,12 @@ describe('Colo - Real-World Scenarios', () => {
 
   bench('multi-region read (fan-out to 3 regions)', async () => {
     // Read from multiple regions and use fastest response
-    const results = await Promise.all([
+    await Promise.all([
       fetch('https://ord.colo.do/ping').then(r => ({ region: 'ord', response: r })),
       fetch('https://lhr.colo.do/ping').then(r => ({ region: 'lhr', response: r })),
       fetch('https://nrt.colo.do/ping').then(r => ({ region: 'nrt', response: r })),
     ])
     // In real scenario, you'd use the first response
-    return results
   })
 
   bench('primary-secondary pattern (write to primary, read from secondary)', async () => {

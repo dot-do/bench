@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@dotdo/poc-tigerbeetle-do':
+        specifier: file:../pocs/packages/tigerbeetle-do
+        version: file:../pocs/packages/tigerbeetle-do(@cloudflare/workers-types@4.20260120.0)
       hono:
         specifier: ^4.7.0
         version: 4.11.4
@@ -135,6 +138,11 @@ packages:
   '@cspotcode/source-map-support@0.8.1':
     resolution: {integrity: sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw==}
     engines: {node: '>=12'}
+
+  '@dotdo/poc-tigerbeetle-do@file:../pocs/packages/tigerbeetle-do':
+    resolution: {directory: ../pocs/packages/tigerbeetle-do, type: directory}
+    peerDependencies:
+      '@cloudflare/workers-types': ^4.0.0
 
   '@emnapi/runtime@1.8.1':
     resolution: {integrity: sha512-mehfKSMWjjNol8659Z8KxEMrdSJDDot5SXMq00dM8BN4o+CLNXQ0xH2V7EchNHV4RmbZLmmPdEaXZc5H2FXmDg==}
@@ -1589,6 +1597,10 @@ snapshots:
   '@cspotcode/source-map-support@0.8.1':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.9
+
+  '@dotdo/poc-tigerbeetle-do@file:../pocs/packages/tigerbeetle-do(@cloudflare/workers-types@4.20260120.0)':
+    dependencies:
+      '@cloudflare/workers-types': 4.20260120.0
 
   '@emnapi/runtime@1.8.1':
     dependencies:

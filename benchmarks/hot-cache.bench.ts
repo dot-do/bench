@@ -340,8 +340,8 @@ describe('Hot Cache - Edge Cache Hit', () => {
       const cached = edgeCache.get(`/api/things/${TEST_KEY}`)
       const isStale = false // In real impl, check timestamp
       if (cached && !isStale) {
-        // Return immediately - this is what we're measuring
-        return cached
+        // Use cached value - this is what we're measuring
+        void cached
       }
       // Background revalidation would happen here (not measured)
     },
@@ -526,7 +526,7 @@ describe('Hot Cache - Combined Patterns', () => {
     () => {
       // First check request-scoped cache
       const cached = requestScopedCache.get(TEST_KEY)
-      if (cached) return cached
+      if (cached) void cached // Use cached value
       // Would fall through to L2/L3 on miss
     },
     { warmupIterations: 1000, iterations: 10000 }
@@ -538,13 +538,13 @@ describe('Hot Cache - Combined Patterns', () => {
       // Simulate L1 miss
       const l1Miss = new Map<string, Thing>()
       const cached = l1Miss.get(TEST_KEY)
-      if (cached) return cached
+      if (cached) void cached // Use cached value
 
       // Fall through to edge cache
       const edgeCached = edgeCache.getJSON<Thing>(`/api/things/${TEST_KEY}`)
       if (edgeCached) {
         l1Miss.set(TEST_KEY, edgeCached)
-        return edgeCached
+        void edgeCached // Use cached value
       }
     },
     { warmupIterations: 1000, iterations: 10000 }
@@ -556,18 +556,18 @@ describe('Hot Cache - Combined Patterns', () => {
       // Simulate L1 miss
       const l1Miss = new Map<string, Thing>()
       const l1Cached = l1Miss.get(TEST_KEY)
-      if (l1Cached) return l1Cached
+      if (l1Cached) void l1Cached // Use cached value
 
       // Simulate L2 miss
       const l2Miss = new EdgeCache()
       const l2Cached = l2Miss.getJSON<Thing>(`/api/things/${TEST_KEY}`)
-      if (l2Cached) return l2Cached
+      if (l2Cached) void l2Cached // Use cached value
 
       // Fall through to SQLite (hot)
       const dbResult = sqliteStore.get(TEST_KEY)
       if (dbResult) {
         l1Miss.set(TEST_KEY, dbResult)
-        return dbResult
+        void dbResult // Use cached value
       }
     },
     { warmupIterations: 1000, iterations: 10000 }
