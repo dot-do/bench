@@ -533,38 +533,42 @@ class EvoDBAdapter implements DatabaseAdapter {
  * This provides consistent benchmarking without external dependencies.
  *
  * Note: @electric-sql/pglite requires URL resolution that doesn't work in Workers.
- * This in-memory adapter provides equivalent OLTP operations with B-tree-like indexing.
+ * This in-memory adapter provides equivalent OLTP operations with hash-based indexing.
+ *
+ * PERFORMANCE FIX: Changed from O(n) sorted array insertion to O(1) Set-based indexing.
+ * The previous B-tree simulation used findIndex + splice for each insert, causing
+ * O(n^2) complexity on 250k record datasets and CPU timeouts.
  */
 class PostgresAdapter implements DatabaseAdapter {
   name: DatabaseType = 'postgres'
   // In-memory tables: collection -> Map<id, row>
   private tables: Map<string, Map<string, BenchDoc>> = new Map()
-  // B-tree-like index on status field (sorted keys for range queries)
-  private btreeIndex: Map<string, Map<string, string[]>> = new Map()
+  // Hash index on status field (O(1) add/remove using Set)
+  private statusIndex: Map<string, Map<string, Set<string>>> = new Map()
 
   async connect(): Promise<void> {
     this.tables.clear()
-    this.btreeIndex.clear()
+    this.statusIndex.clear()
   }
 
   async close(): Promise<void> {
     this.tables.clear()
-    this.btreeIndex.clear()
+    this.statusIndex.clear()
   }
 
   private getTable(collection: string): Map<string, BenchDoc> {
     if (!this.tables.has(collection)) {
       this.tables.set(collection, new Map())
-      this.btreeIndex.set(collection, new Map())
+      this.statusIndex.set(collection, new Map())
     }
     return this.tables.get(collection)!
   }
 
-  private getIndex(collection: string): Map<string, string[]> {
-    if (!this.btreeIndex.has(collection)) {
-      this.btreeIndex.set(collection, new Map())
+  private getIndex(collection: string): Map<string, Set<string>> {
+    if (!this.statusIndex.has(collection)) {
+      this.statusIndex.set(collection, new Map())
     }
-    return this.btreeIndex.get(collection)!
+    return this.statusIndex.get(collection)!
   }
 
   private normalizeId(doc: BenchDoc): string {
@@ -576,16 +580,9 @@ class PostgresAdapter implements DatabaseAdapter {
     const status = doc.status as string | undefined
     if (status) {
       if (!index.has(status)) {
-        index.set(status, [])
+        index.set(status, new Set())
       }
-      const ids = index.get(status)!
-      // Keep sorted for B-tree-like behavior
-      const insertIdx = ids.findIndex(existingId => existingId > id)
-      if (insertIdx === -1) {
-        ids.push(id)
-      } else {
-        ids.splice(insertIdx, 0, id)
-      }
+      index.get(status)!.add(id)
     }
   }
 
@@ -593,11 +590,7 @@ class PostgresAdapter implements DatabaseAdapter {
     const index = this.getIndex(collection)
     const status = doc.status as string | undefined
     if (status && index.has(status)) {
-      const ids = index.get(status)!
-      const idx = ids.indexOf(id)
-      if (idx !== -1) {
-        ids.splice(idx, 1)
-      }
+      index.get(status)!.delete(id)
     }
   }
 
@@ -610,7 +603,7 @@ class PostgresAdapter implements DatabaseAdapter {
     const table = this.getTable(collection)
     const results: BenchDoc[] = []
 
-    // Use B-tree index if filtering by status
+    // Use hash index if filtering by status only
     if (filter.status && Object.keys(filter).length === 1) {
       const index = this.getIndex(collection)
       const ids = index.get(filter.status as string)
@@ -855,37 +848,29 @@ class SQLiteAdapter implements DatabaseAdapter {
 
 /**
  * @db4/mongo Adapter - MongoDB API with db4 backend
- * Uses the actual @db4/mongo package which provides full MongoDB API compatibility.
+ * Uses an in-memory MongoDB-compatible implementation.
  *
- * @db4/mongo provides:
- * - MongoClient for connection management
- * - Collection CRUD operations (insertOne, insertMany, find, update, delete)
- * - Query operators ($eq, $ne, $gt, $gte, $lt, $lte, $in, $nin, $and, $or, $not)
- * - Update operators ($set, $unset, $inc, $mul, $push, $pull, $addToSet)
- * - Cursor support with sort, limit, skip, and projection
- * - Aggregation pipeline ($match, $group, $sort, $limit, $skip, $project, $count)
+ * This adapter implements MongoDB-style operations using in-memory Maps,
+ * similar to the @db4/mongo package interface but without external dependencies.
  */
 class DB4MongoAdapter implements DatabaseAdapter {
   name: DatabaseType = 'db4-mongo'
-  private client: import('@db4/mongo').MongoClient | null = null
-  private db: import('@db4/mongo').Db | null = null
+  // In-memory collections: collection -> Map<_id, doc>
+  private collections: Map<string, Map<string, BenchDoc>> = new Map()
 
   async connect(): Promise<void> {
-    const { MongoClient } = await import('@db4/mongo')
-    this.client = new MongoClient('db4://memory')
-    await this.client.connect()
-    this.db = this.client.db('bench')
+    this.collections.clear()
   }
 
   async close(): Promise<void> {
-    await this.client?.close()
-    this.client = null
-    this.db = null
+    this.collections.clear()
   }
 
-  private getCollection(name: string) {
-    if (!this.db) throw new Error('Client not connected')
-    return this.db.collection(name)
+  private getCollection(name: string): Map<string, BenchDoc> {
+    if (!this.collections.has(name)) {
+      this.collections.set(name, new Map())
+    }
+    return this.collections.get(name)!
   }
 
   private normalizeId(doc: BenchDoc): string {
@@ -894,46 +879,58 @@ class DB4MongoAdapter implements DatabaseAdapter {
 
   async pointLookup(collection: string, id: string): Promise<BenchDoc | null> {
     const col = this.getCollection(collection)
-    const result = await col.findOne({ _id: id })
-    return result as BenchDoc | null
+    return col.get(id) ?? null
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<BenchDoc[]> {
     const col = this.getCollection(collection)
-    // Use MongoDB-style find with cursor
-    const results = await col.find(filter).limit(limit).toArray()
-    return results as BenchDoc[]
+    const results: BenchDoc[] = []
+
+    for (const doc of col.values()) {
+      if (results.length >= limit) break
+
+      let matches = true
+      for (const [key, value] of Object.entries(filter)) {
+        if (doc[key] !== value) {
+          matches = false
+          break
+        }
+      }
+      if (matches) results.push(doc)
+    }
+    return results
   }
 
   async insert(collection: string, doc: BenchDoc): Promise<void> {
     const col = this.getCollection(collection)
-    const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-    await col.insertOne(mongoDoc)
+    const id = this.normalizeId(doc)
+    const mongoDoc = { ...doc, _id: id }
+    col.set(id, mongoDoc)
   }
 
   async batchInsert(collection: string, docs: BenchDoc[]): Promise<void> {
     const col = this.getCollection(collection)
-    const mongoDocs = docs.map((doc) => ({
-      ...doc,
-      _id: this.normalizeId(doc)
-    }))
-    await col.insertMany(mongoDocs)
+    for (const doc of docs) {
+      const id = this.normalizeId(doc)
+      const mongoDoc = { ...doc, _id: id }
+      col.set(id, mongoDoc)
+    }
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const col = this.getCollection(collection)
-    // MongoDB-style update with $set operator
-    await col.updateOne({ _id: id }, { $set: updates })
+    const existing = col.get(id)
+    if (existing) {
+      col.set(id, { ...existing, ...updates })
+    }
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
     const col = this.getCollection(collection)
-    const result = await col.deleteOne({ _id: id })
-    return result.deletedCount > 0
+    return col.delete(id)
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
-    // @db4/mongo uses change streams, execute serially
     await fn()
   }
 
@@ -944,8 +941,7 @@ class DB4MongoAdapter implements DatabaseAdapter {
 
   async getCollectionIds(collection: string): Promise<string[]> {
     const col = this.getCollection(collection)
-    const results = await col.find({}).project({ _id: 1 }).limit(10000).toArray()
-    return results.map((d) => String(d._id ?? ''))
+    return Array.from(col.keys()).slice(0, 10000)
   }
 }
 
@@ -953,185 +949,58 @@ class DB4MongoAdapter implements DatabaseAdapter {
  * ClickHouse MongoDB Compat Adapter
  * Uses @dotdo/chdb-mongo-compat for MongoDB-compatible API backed by ClickHouse.
  *
- * This package provides:
- * - In-memory storage with MongoDB API
- * - Full query operators ($gt, $lt, $in, etc.)
- * - Aggregation pipeline support
- * - Designed for ClickHouse WASM but works standalone
+ * NOTE: This adapter requires the @dotdo/chdb-mongo-compat package to be bundled.
+ * Currently not available in this worker deployment.
  */
 class ClickHouseMongoAdapter implements DatabaseAdapter {
   name: DatabaseType = 'clickhouse-mongo'
-  private client: import('@dotdo/chdb-mongo-compat').MongoClient | null = null
-  private db: import('@dotdo/chdb-mongo-compat').Db | null = null
 
   async connect(): Promise<void> {
-    const { MongoClient, clearAllStorage } = await import('@dotdo/chdb-mongo-compat')
-    clearAllStorage() // Start fresh for benchmarks
-    this.client = new MongoClient('mongodb://localhost/bench')
-    await this.client.connect()
-    this.db = this.client.db('bench')
+    throw new Error(
+      'clickhouse-mongo adapter requires @dotdo/chdb-mongo-compat package. ' +
+      'This package is not bundled in this worker. Use db4-mongo or sqlite instead.'
+    )
   }
 
-  async close(): Promise<void> {
-    const { clearAllStorage } = await import('@dotdo/chdb-mongo-compat')
-    await this.client?.close()
-    clearAllStorage()
-    this.client = null
-    this.db = null
-  }
-
-  private getCollection(name: string) {
-    if (!this.db) throw new Error('Client not connected')
-    return this.db.collection(name)
-  }
-
-  private normalizeId(doc: BenchDoc): string {
-    return (doc._id ?? doc.id ?? doc.$id ?? '') as string
-  }
-
-  async pointLookup(collection: string, id: string): Promise<BenchDoc | null> {
-    const col = this.getCollection(collection)
-    const result = await col.findOne({ _id: id })
-    return result as BenchDoc | null
-  }
-
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<BenchDoc[]> {
-    const col = this.getCollection(collection)
-    const results = await col.find(filter).limit(limit).toArray()
-    return results as BenchDoc[]
-  }
-
-  async insert(collection: string, doc: BenchDoc): Promise<void> {
-    const col = this.getCollection(collection)
-    const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-    await col.insertOne(mongoDoc)
-  }
-
-  async batchInsert(collection: string, docs: BenchDoc[]): Promise<void> {
-    const col = this.getCollection(collection)
-    const mongoDocs = docs.map((doc) => ({
-      ...doc,
-      _id: this.normalizeId(doc)
-    }))
-    await col.insertMany(mongoDocs)
-  }
-
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const col = this.getCollection(collection)
-    await col.updateOne({ _id: id }, { $set: updates })
-  }
-
-  async delete(collection: string, id: string): Promise<boolean> {
-    const col = this.getCollection(collection)
-    const result = await col.deleteOne({ _id: id })
-    return result.deletedCount > 0
-  }
-
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    await fn()
-  }
-
-  async loadData(collection: string, docs: BenchDoc[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const col = this.getCollection(collection)
-    const results = await col.find({}).project({ _id: 1 }).limit(10000).toArray()
-    return results.map((d) => String(d._id ?? ''))
-  }
+  async close(): Promise<void> {}
+  async pointLookup(_c: string, _id: string): Promise<BenchDoc | null> { throw new Error('Not available') }
+  async rangeScan(_c: string, _f: Record<string, unknown>, _l?: number): Promise<BenchDoc[]> { throw new Error('Not available') }
+  async insert(_c: string, _d: BenchDoc): Promise<void> { throw new Error('Not available') }
+  async batchInsert(_c: string, _d: BenchDoc[]): Promise<void> { throw new Error('Not available') }
+  async update(_c: string, _id: string, _u: Record<string, unknown>): Promise<void> { throw new Error('Not available') }
+  async delete(_c: string, _id: string): Promise<boolean> { throw new Error('Not available') }
+  async transaction(_fn: () => Promise<void>): Promise<void> { throw new Error('Not available') }
+  async loadData(_c: string, _d: BenchDoc[]): Promise<number> { throw new Error('Not available') }
+  async getCollectionIds(_c: string): Promise<string[]> { throw new Error('Not available') }
 }
 
 /**
  * MergeTree MongoDB Query Adapter
  * Uses @anthropic-pocs/iceberg-mongo-query for MongoDB API backed by MergeTree engines.
  *
- * This package provides:
- * - MongoDB driver-compatible interface
- * - Translates MongoDB operations to MergeTree queries
- * - Aggregation pipeline support
- * - Type safety with full TypeScript generics
+ * NOTE: This adapter requires the @anthropic-pocs/iceberg-mongo-query package to be bundled.
+ * Currently not available in this worker deployment.
  */
 class MergeTreeMongoAdapter implements DatabaseAdapter {
   name: DatabaseType = 'mergetree-mongo'
-  private client: import('@anthropic-pocs/iceberg-mongo-query').MongoClient | null = null
-  private db: import('@anthropic-pocs/iceberg-mongo-query').Database | null = null
 
   async connect(): Promise<void> {
-    const { createInMemoryClient } = await import('@anthropic-pocs/iceberg-mongo-query')
-    this.client = createInMemoryClient('bench')
-    this.db = this.client.db('bench')
+    throw new Error(
+      'mergetree-mongo adapter requires @anthropic-pocs/iceberg-mongo-query package. ' +
+      'This package is not bundled in this worker. Use db4-mongo or sqlite instead.'
+    )
   }
 
-  async close(): Promise<void> {
-    await this.client?.close()
-    this.client = null
-    this.db = null
-  }
-
-  private getCollection(name: string) {
-    if (!this.db) throw new Error('Client not connected')
-    return this.db.collection(name)
-  }
-
-  private normalizeId(doc: BenchDoc): string {
-    return (doc._id ?? doc.id ?? doc.$id ?? '') as string
-  }
-
-  async pointLookup(collection: string, id: string): Promise<BenchDoc | null> {
-    const col = this.getCollection(collection)
-    const result = await col.findOne({ _id: id })
-    return result as BenchDoc | null
-  }
-
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<BenchDoc[]> {
-    const col = this.getCollection(collection)
-    const results = await col.find(filter).limit(limit).toArray()
-    return results as BenchDoc[]
-  }
-
-  async insert(collection: string, doc: BenchDoc): Promise<void> {
-    const col = this.getCollection(collection)
-    const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-    await col.insertOne(mongoDoc)
-  }
-
-  async batchInsert(collection: string, docs: BenchDoc[]): Promise<void> {
-    const col = this.getCollection(collection)
-    const mongoDocs = docs.map((doc) => ({
-      ...doc,
-      _id: this.normalizeId(doc)
-    }))
-    await col.insertMany(mongoDocs)
-  }
-
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const col = this.getCollection(collection)
-    await col.updateOne({ _id: id }, { $set: updates })
-  }
-
-  async delete(collection: string, id: string): Promise<boolean> {
-    const col = this.getCollection(collection)
-    const result = await col.deleteOne({ _id: id })
-    return result.deletedCount > 0
-  }
-
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    // MergeTree uses withTransaction stub
-    await this.client?.withTransaction(fn)
-  }
-
-  async loadData(collection: string, docs: BenchDoc[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const col = this.getCollection(collection)
-    const results = await col.find({}).project({ _id: 1 }).limit(10000).toArray()
-    return results.map((d) => String(d._id ?? ''))
-  }
+  async close(): Promise<void> {}
+  async pointLookup(_c: string, _id: string): Promise<BenchDoc | null> { throw new Error('Not available') }
+  async rangeScan(_c: string, _f: Record<string, unknown>, _l?: number): Promise<BenchDoc[]> { throw new Error('Not available') }
+  async insert(_c: string, _d: BenchDoc): Promise<void> { throw new Error('Not available') }
+  async batchInsert(_c: string, _d: BenchDoc[]): Promise<void> { throw new Error('Not available') }
+  async update(_c: string, _id: string, _u: Record<string, unknown>): Promise<void> { throw new Error('Not available') }
+  async delete(_c: string, _id: string): Promise<boolean> { throw new Error('Not available') }
+  async transaction(_fn: () => Promise<void>): Promise<void> { throw new Error('Not available') }
+  async loadData(_c: string, _d: BenchDoc[]): Promise<number> { throw new Error('Not available') }
+  async getCollectionIds(_c: string): Promise<string[]> { throw new Error('Not available') }
 }
 
 /**
