@@ -1,0 +1,252 @@
+# Analytics Dataset Staging Worker
+#
+# Stages large analytics datasets using Sandbox SDK for network downloads.
+# Spins up sandbox containers with network access to download external datasets
+# and streams them directly to R2 storage.
+#
+# Supported Datasets:
+# - clickbench: ClickBench hits.parquet (~14GB) - Web analytics benchmark
+# - imdb: IMDB datasets (title.basics, name.basics, title.ratings) - ~1.5GB uncompressed
+#
+# Deploy with: wrangler deploy --config worker/stage-analytics.wrangler.toml
+#
+# @see https://datasets.clickhouse.com/hits_compatible/
+# @see https://datasets.imdbws.com/
+# @see scripts/download/clickbench.ts
+# @see scripts/download/imdb.ts
+
+name = "stage-analytics"
+main = "stage-analytics.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers settings
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+
+# Build settings
+[build]
+command = "npx esbuild stage-analytics.ts --bundle --outfile=dist/stage-analytics.js --format=esm --platform=browser"
+
+# Performance settings for large file download and streaming
+# ClickBench is ~14GB and requires significant time to download
+[limits]
+cpu_ms = 1800000  # 30 minutes max CPU time for ClickBench (~14GB download)
+
+# Observability
+[observability]
+enabled = true
+head_sampling_rate = 1  # Full sampling for staging operations
+
+# =============================================================================
+# R2 Bucket for Analytics Datasets
+# =============================================================================
+
+[[r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets"
+# preview_bucket_name = "analytics-datasets-preview"
+
+# Bucket structure:
+# analytics-datasets/
+#   analytics/
+#     clickbench/
+#       hits.parquet               # ~14 GB ClickBench data
+#     imdb/
+#       title.basics.tsv           # ~700 MB movie/show titles
+#       name.basics.tsv            # ~800 MB names (actors, directors, etc.)
+#       title.ratings.tsv          # ~25 MB ratings data
+
+# =============================================================================
+# Sandbox SDK Configuration
+# =============================================================================
+
+# Sandbox API token - stores authentication for Sandbox SDK
+# Set via wrangler secret: wrangler secret put DO_TOKEN
+[secrets]
+# DO_TOKEN = ""
+
+# Optional: Custom Sandbox API base URL (defaults to https://api.do)
+# [vars]
+# SANDBOX_API_URL = "https://api.do"
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "info"
+
+# Development environment - uses local/preview buckets
+[env.dev]
+vars = { ENVIRONMENT = "development", LOG_LEVEL = "debug" }
+
+[[env.dev.r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets-dev"
+
+# Staging environment - uses staging buckets
+[env.staging]
+vars = { ENVIRONMENT = "staging", LOG_LEVEL = "info" }
+
+[[env.staging.r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets-staging"
+
+# =============================================================================
+# Deployment Notes
+# =============================================================================
+
+# Prerequisites:
+#
+# 1. Create the R2 bucket:
+#    wrangler r2 bucket create analytics-datasets
+#
+# 2. Set up Sandbox SDK authentication:
+#    wrangler secret put DO_TOKEN --config worker/stage-analytics.wrangler.toml
+#
+# 3. (Optional) Create dev/staging buckets:
+#    wrangler r2 bucket create analytics-datasets-dev
+#    wrangler r2 bucket create analytics-datasets-staging
+#
+# Deployment:
+#
+# 1. Deploy the worker:
+#    wrangler deploy --config worker/stage-analytics.wrangler.toml
+#
+# 2. Deploy to dev environment:
+#    wrangler deploy --config worker/stage-analytics.wrangler.toml --env dev
+#
+# Usage:
+#
+# 1. List available datasets:
+#    curl "https://stage-analytics.your-subdomain.workers.dev/datasets"
+#
+# 2. Stage ClickBench dataset (~14GB, takes 20-40 minutes):
+#    curl -X POST "https://stage-analytics.your-subdomain.workers.dev/stage/clickbench"
+#
+# 3. Stage IMDB datasets (~1.5GB, takes 5-10 minutes):
+#    curl -X POST "https://stage-analytics.your-subdomain.workers.dev/stage/imdb"
+#
+# 4. Stage all datasets:
+#    curl -X POST "https://stage-analytics.your-subdomain.workers.dev/stage-all"
+#
+# 5. Check dataset status:
+#    curl "https://stage-analytics.your-subdomain.workers.dev/status/clickbench"
+#    curl "https://stage-analytics.your-subdomain.workers.dev/status/imdb"
+#
+# 6. Delete a staged dataset:
+#    curl -X DELETE "https://stage-analytics.your-subdomain.workers.dev/stage/clickbench"
+#    curl -X DELETE "https://stage-analytics.your-subdomain.workers.dev/stage/imdb"
+#
+# Dataset Details:
+#
+# ClickBench (hits.parquet):
+# - Source: https://datasets.clickhouse.com/hits_compatible/hits.parquet
+# - Size: ~14 GB
+# - Format: Apache Parquet
+# - Content: Anonymized web analytics data from Yandex.Metrica
+# - Records: ~100 million rows
+# - Columns: 105 columns including timestamps, URLs, referrers, user agents, etc.
+# - Use case: Standard benchmark for analytical databases (ClickHouse, DuckDB, etc.)
+# - Download time: 20-40 minutes depending on sandbox network
+# - Sandbox memory: 4096 MB (standard-2 or higher recommended)
+#
+# IMDB:
+# - Source: https://datasets.imdbws.com/
+# - Total size: ~400 MB compressed, ~1.5 GB uncompressed
+# - Format: TSV (tab-separated values), gzip compressed at source
+# - Files:
+#   - title.basics.tsv.gz -> title.basics.tsv (~700 MB)
+#     Movie/show titles, types, years, genres
+#   - name.basics.tsv.gz -> name.basics.tsv (~800 MB)
+#     Names of actors, directors, writers, etc.
+#   - title.ratings.tsv.gz -> title.ratings.tsv (~25 MB)
+#     IMDB ratings and vote counts
+# - Use case: Movie/TV database queries, join performance testing
+# - Download time: 5-10 minutes
+# - Note: IMDB data is for non-commercial use only
+# - Sandbox memory: 2048 MB (standard-2)
+#
+# Sandbox Configuration:
+#
+# The worker creates sandboxes with the following settings:
+#
+# ClickBench:
+#   - Memory: 4096 MB (standard-2 container size)
+#   - Timeout: 1,800,000 ms (30 minutes)
+#   - Network access: Enabled (for external download)
+#   - File system: Enabled
+#
+# IMDB:
+#   - Memory: 2048 MB (standard-2 container size)
+#   - Timeout: 600,000 ms (10 minutes)
+#   - Network access: Enabled (for external download)
+#   - File system: Enabled
+#
+# Time Estimates:
+#
+# Download times vary based on network conditions and sandbox location:
+#
+# ClickBench (~14 GB):
+#   - Best case: ~15 minutes (100+ MB/s network)
+#   - Typical: ~25-30 minutes (50-80 MB/s)
+#   - Worst case: ~45 minutes (25 MB/s)
+#   - Stream to R2: ~5-10 minutes
+#   - Total: 20-60 minutes
+#
+# IMDB (~400 MB compressed):
+#   - Download: ~2-5 minutes
+#   - Decompress: ~1-2 minutes
+#   - Stream to R2: ~1-2 minutes
+#   - Total: 5-10 minutes
+#
+# Cost Estimation:
+#
+# Sandbox API pricing (typical rates):
+# - Compute: Based on memory-seconds used
+# - ClickBench (4GB, 30min): ~$0.15-0.30
+# - IMDB (2GB, 10min): ~$0.03-0.05
+#
+# R2 Storage costs:
+# - Storage: $0.015/GB/month
+# - ClickBench: ~$0.21/month
+# - IMDB: ~$0.02/month
+# - Total: ~$0.25/month
+#
+# Data Transfer:
+# - Sandbox egress: Included with sandbox pricing
+# - R2 ingress: Free
+#
+# Caching:
+#
+# The worker checks if datasets already exist in R2 before downloading:
+# - If all expected files exist, returns cached info immediately
+# - Use DELETE endpoint to force re-download
+#
+# Error Handling:
+#
+# The worker handles several error cases:
+# - Network timeouts during download
+# - Decompression errors for IMDB gzip files
+# - R2 upload failures
+# - Sandbox creation/execution failures
+#
+# On error, the response includes:
+# - Error message
+# - Partial results (if any files were uploaded)
+# - Last 5KB of sandbox logs for debugging
+#
+# Health Check:
+#
+# Verify the worker is running:
+#    curl "https://stage-analytics.your-subdomain.workers.dev/health"
+#
+# Scheduling (optional):
+#
+# To automatically refresh datasets on a schedule, use Cron Triggers:
+# [triggers]
+# crons = ["0 0 1 * *"]  # Monthly on the 1st at midnight UTC
+#
+# Note: IMDB data is updated daily; ClickBench rarely changes.
+# Consider weekly updates for IMDB if freshness is important.

@@ -1,0 +1,272 @@
+# MongoDB Container for Cloudflare Containers
+# Includes HTTP bridge for Worker communication
+FROM mongo:7
+
+# Install Node.js for HTTP bridge
+RUN apt-get update && apt-get install -y \
+    nodejs \
+    npm \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create HTTP bridge directory
+WORKDIR /app
+
+# Create package.json
+RUN cat > /app/package.json << 'EOF'
+{
+  "name": "mongo-http-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "mongodb": "^6.0.0"
+  }
+}
+EOF
+
+RUN npm install
+
+# Create the HTTP bridge server
+RUN cat > /app/server.mjs << 'EOF'
+import { createServer } from 'http';
+import { MongoClient, ObjectId } from 'mongodb';
+
+const uri = process.env.MONGODB_URI || 'mongodb://localhost:27017';
+const client = new MongoClient(uri);
+
+let connected = false;
+
+async function connect() {
+  if (!connected) {
+    await client.connect();
+    connected = true;
+  }
+  return client;
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  try {
+    if (url.pathname === '/health' || url.pathname === '/ping') {
+      const c = await connect();
+      await c.db('admin').command({ ping: 1 });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'healthy' }));
+      return;
+    }
+
+    if (url.pathname === '/ready') {
+      try {
+        const c = await connect();
+        await c.db('admin').command({ ping: 1 });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ready: true }));
+      } catch {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ready: false }));
+      }
+      return;
+    }
+
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+
+    const body = await new Promise((resolve) => {
+      let data = '';
+      req.on('data', chunk => data += chunk);
+      req.on('end', () => resolve(JSON.parse(data || '{}')));
+    });
+
+    const c = await connect();
+    const db = c.db(body.database || 'test');
+    const collection = body.collection ? db.collection(body.collection) : null;
+
+    if (url.pathname === '/find') {
+      const cursor = collection.find(body.filter || {}, {
+        projection: body.projection,
+        sort: body.sort,
+        limit: body.limit,
+        skip: body.skip,
+      });
+      const documents = await cursor.toArray();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ documents }));
+      return;
+    }
+
+    if (url.pathname === '/findOne') {
+      const document = await collection.findOne(body.filter || {}, {
+        projection: body.projection,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ document }));
+      return;
+    }
+
+    if (url.pathname === '/insertOne') {
+      const result = await collection.insertOne(body.document);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        insertedId: result.insertedId?.toString(),
+        insertedCount: 1,
+      }));
+      return;
+    }
+
+    if (url.pathname === '/insertMany') {
+      const result = await collection.insertMany(body.documents);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        insertedCount: result.insertedCount,
+      }));
+      return;
+    }
+
+    if (url.pathname === '/updateOne') {
+      const result = await collection.updateOne(
+        body.filter || {},
+        body.update,
+        { upsert: body.upsert }
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount,
+        upsertedCount: result.upsertedCount,
+        upsertedId: result.upsertedId?.toString(),
+      }));
+      return;
+    }
+
+    if (url.pathname === '/updateMany') {
+      const result = await collection.updateMany(
+        body.filter || {},
+        body.update,
+        { upsert: body.upsert }
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        matchedCount: result.matchedCount,
+        modifiedCount: result.modifiedCount,
+        upsertedCount: result.upsertedCount,
+      }));
+      return;
+    }
+
+    if (url.pathname === '/deleteOne') {
+      const result = await collection.deleteOne(body.filter || {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        deletedCount: result.deletedCount,
+      }));
+      return;
+    }
+
+    if (url.pathname === '/deleteMany') {
+      const result = await collection.deleteMany(body.filter || {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        acknowledged: result.acknowledged,
+        deletedCount: result.deletedCount,
+      }));
+      return;
+    }
+
+    if (url.pathname === '/aggregate') {
+      const cursor = collection.aggregate(body.pipeline || []);
+      const documents = await cursor.toArray();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ documents }));
+      return;
+    }
+
+    if (url.pathname === '/count') {
+      const count = await collection.countDocuments(body.filter || {});
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ count }));
+      return;
+    }
+
+    if (url.pathname === '/createIndex') {
+      const indexName = await collection.createIndex(body.keys, {
+        unique: body.unique,
+        name: body.name,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ indexName }));
+      return;
+    }
+
+    if (url.pathname === '/listCollections') {
+      const collections = await db.listCollections().toArray();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        collections: collections.map(c => c.name),
+      }));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+
+  } catch (error) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+});
+
+server.listen(8080, '0.0.0.0', () => {
+  console.log('MongoDB HTTP bridge listening on port 8080');
+});
+EOF
+
+# Create entrypoint script
+RUN cat > /app/entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+# Start MongoDB in background
+mongod --bind_ip_all --fork --logpath /var/log/mongodb.log
+
+# Wait for MongoDB to be ready
+until mongosh --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+  echo "Waiting for MongoDB..."
+  sleep 1
+done
+
+echo "MongoDB is ready"
+
+# Start HTTP bridge
+exec node /app/server.mjs
+EOF
+
+RUN chmod +x /app/entrypoint.sh
+
+# Expose HTTP bridge port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=5s --timeout=3s --start-period=15s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["/app/entrypoint.sh"]

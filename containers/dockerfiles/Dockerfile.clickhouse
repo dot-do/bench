@@ -1,0 +1,51 @@
+# ClickHouse Container for Cloudflare Containers
+# Uses native HTTP interface - no bridge needed
+FROM clickhouse/clickhouse-server:latest
+
+# ClickHouse already has HTTP interface on port 8123
+# Configure for container use
+ENV CLICKHOUSE_USER=default
+ENV CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+
+# Create config to enable HTTP interface
+RUN cat > /etc/clickhouse-server/config.d/http.xml << 'EOF'
+<clickhouse>
+    <http_port>8123</http_port>
+    <listen_host>0.0.0.0</listen_host>
+    <max_connections>100</max_connections>
+    <max_concurrent_queries>100</max_concurrent_queries>
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size>
+    <mark_cache_size>5368709120</mark_cache_size>
+    <path>/var/lib/clickhouse/</path>
+    <tmp_path>/var/lib/clickhouse/tmp/</tmp_path>
+    <user_files_path>/var/lib/clickhouse/user_files/</user_files_path>
+    <format_schema_path>/var/lib/clickhouse/format_schemas/</format_schema_path>
+</clickhouse>
+EOF
+
+# Create user config
+RUN cat > /etc/clickhouse-server/users.d/default.xml << 'EOF'
+<clickhouse>
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+</clickhouse>
+EOF
+
+# Expose HTTP port (default ClickHouse HTTP interface)
+EXPOSE 8123
+
+# Health check using ClickHouse's native ping endpoint
+HEALTHCHECK --interval=5s --timeout=3s --start-period=15s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+
+# Use default ClickHouse entrypoint
+ENTRYPOINT ["/entrypoint.sh"]

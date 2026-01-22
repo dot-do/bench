@@ -1,0 +1,233 @@
+# OLTP Dataset Staging Worker
+#
+# Stages OLTP datasets using Sandbox SDK for data generation.
+# Spins up temporary sandbox environments to run dataset generators.
+# Generated JSONL files are stored in R2 for benchmarking.
+#
+# Datasets: ecommerce | saas | social | iot
+# Sizes: 1mb | 10mb | 100mb | 1gb
+#
+# Deploy with: wrangler deploy --config worker/stage-oltp.wrangler.toml
+#
+# @see https://developers.cloudflare.com/workers/platform/environment-variables/
+# @see https://developers.cloudflare.com/r2/
+
+name = "stage-oltp"
+main = "stage-oltp.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers settings
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+
+# Build settings
+[build]
+command = "npx esbuild stage-oltp.ts --bundle --outfile=dist/stage-oltp.js --format=esm --platform=browser"
+
+# Performance settings for data generation worker
+# Data generation can take significant time for larger datasets
+[limits]
+cpu_ms = 900000  # 15 minutes max CPU time for largest datasets (1GB generation)
+
+# Observability
+[observability]
+enabled = true
+head_sampling_rate = 1  # Full sampling for staging operations
+
+# =============================================================================
+# R2 Bucket for Generated OLTP Datasets
+# =============================================================================
+
+[[r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets"
+# preview_bucket_name = "oltp-datasets-preview"
+
+# Bucket structure:
+# oltp-datasets/
+#   oltp/
+#     ecommerce/
+#       1mb/
+#         customers.jsonl
+#         products.jsonl
+#         orders.jsonl
+#         reviews.jsonl
+#       10mb/
+#         ...
+#       100mb/
+#         ...
+#       1gb/
+#         ...
+#     saas/
+#       1mb/
+#         orgs.jsonl
+#         users.jsonl
+#         workspaces.jsonl
+#         documents.jsonl
+#       10mb/
+#         ...
+#     social/
+#       1mb/
+#         users.jsonl
+#         posts.jsonl
+#         comments.jsonl
+#         likes.jsonl
+#         follows.jsonl
+#       10mb/
+#         ...
+#     iot/
+#       1mb/
+#         devices.jsonl
+#         sensors.jsonl
+#         readings.jsonl
+#       10mb/
+#         ...
+
+# =============================================================================
+# Sandbox SDK Configuration
+# =============================================================================
+
+# Sandbox API token - stores authentication for Sandbox SDK
+# Set via wrangler secret: wrangler secret put DO_TOKEN
+[secrets]
+# DO_TOKEN = ""
+
+# Optional: Custom Sandbox API base URL (defaults to https://api.do)
+# [vars]
+# SANDBOX_API_URL = "https://api.do"
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "info"
+
+# Development environment - uses local/preview buckets
+[env.dev]
+vars = { ENVIRONMENT = "development", LOG_LEVEL = "debug" }
+
+[[env.dev.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-dev"
+
+# Staging environment - uses staging buckets
+[env.staging]
+vars = { ENVIRONMENT = "staging", LOG_LEVEL = "info" }
+
+[[env.staging.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-staging"
+
+# =============================================================================
+# Deployment Notes
+# =============================================================================
+
+# Prerequisites:
+#
+# 1. Create the R2 bucket:
+#    wrangler r2 bucket create oltp-datasets
+#
+# 2. Set up Sandbox SDK authentication:
+#    wrangler secret put DO_TOKEN --config worker/stage-oltp.wrangler.toml
+#
+# 3. (Optional) Create dev/staging buckets:
+#    wrangler r2 bucket create oltp-datasets-dev
+#    wrangler r2 bucket create oltp-datasets-staging
+#
+# Deployment:
+#
+# 1. Deploy the worker:
+#    wrangler deploy --config worker/stage-oltp.wrangler.toml
+#
+# 2. Deploy to dev environment:
+#    wrangler deploy --config worker/stage-oltp.wrangler.toml --env dev
+#
+# Usage:
+#
+# 1. List available datasets:
+#    curl "https://stage-oltp.your-subdomain.workers.dev/datasets"
+#
+# 2. Stage a specific dataset:
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/ecommerce/100mb"
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/saas/1gb"
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/social/10mb"
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/iot/100mb"
+#
+# 3. Check dataset status:
+#    curl "https://stage-oltp.your-subdomain.workers.dev/status/ecommerce/100mb"
+#
+# 4. Delete a staged dataset:
+#    curl -X DELETE "https://stage-oltp.your-subdomain.workers.dev/stage/ecommerce/100mb"
+#
+# 5. Stage all datasets of a specific size:
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage-all/100mb"
+#
+# Available Datasets:
+#
+# - ecommerce: E-commerce OLTP data
+#   Tables: customers, products, orders, reviews
+#   Use case: Testing e-commerce platforms, order processing
+#
+# - saas: SaaS Multi-Tenant data
+#   Tables: orgs, users, workspaces, documents
+#   Use case: Testing multi-tenant SaaS applications
+#
+# - social: Social Network data
+#   Tables: users, posts, comments, likes, follows
+#   Use case: Testing social platforms, graph queries
+#
+# - iot: IoT Timeseries data
+#   Tables: devices, sensors, readings
+#   Use case: Testing time-series databases, sensor data
+#
+# Available Sizes:
+#
+# - 1mb: Minimal dataset for quick testing (~5-10 seconds generation)
+# - 10mb: Small dataset for unit tests (~30-60 seconds generation)
+# - 100mb: Medium dataset for integration tests (~2-5 minutes generation)
+# - 1gb: Large dataset for performance benchmarks (~10-15 minutes generation)
+#
+# Generation Time Estimates (using default sandbox resources):
+#
+# Sandbox CPU limit: 900,000ms (15 minutes)
+# Default timeouts by size:
+# - 1mb:   120,000ms (2 minutes)
+# - 10mb:  120,000ms (2 minutes)
+# - 100mb: 300,000ms (5 minutes)
+# - 1gb:   600,000ms (10 minutes)
+#
+# Sandbox Memory by dataset size:
+# - 1mb:   512MB
+# - 10mb:  512MB
+# - 100mb: 1024MB
+# - 1gb:   2048MB
+#
+# Cost Estimation:
+#
+# Sandbox API pricing (typical rates):
+# - Compute: Based on memory-seconds used during generation
+# - 1mb:   ~$0.001-0.002
+# - 10mb:  ~$0.002-0.003
+# - 100mb: ~$0.01-0.02
+# - 1gb:   ~$0.05-0.10
+#
+# R2 Storage costs:
+# - Storage: $0.015/GB/month
+# - Total storage for all sizes: ~4-5GB = ~$0.07/month
+#
+# API Calls:
+# - Per-million API calls: $0.36
+# - Typical generation job: ~10-50 API calls
+#
+# Health Check:
+#
+# Verify the worker is running:
+#    curl "https://stage-oltp.your-subdomain.workers.dev/health"
+#
+# Scheduling (optional):
+#
+# To automatically stage datasets on a schedule, use Cron Triggers:
+# [triggers]
+# crons = ["0 0 * * 0"]  # Weekly on Sunday at midnight UTC

@@ -19,6 +19,8 @@
     "bench:cost": "node scripts/calculate-costs.js",
     "bench:vfs": "vitest bench --run benchmarks/vfs-cost.bench.ts",
     "bench:all": "pnpm bench:bundle && pnpm bench:run && pnpm bench:cost",
+    "report": "npx tsx scripts/generate-report.ts",
+    "report:all": "pnpm bench:all && pnpm report",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",

@@ -1,0 +1,318 @@
+# OLTP Benchmark Worker Configuration
+#
+# Runs OLTP benchmarks across multiple databases:
+# - db4: Pure TypeScript document store
+# - evodb: Event-sourced document store
+# - postgres: PGLite WASM (PostgreSQL-compatible)
+# - sqlite: libsql WASM (SQLite-compatible)
+# - db4-mongo: MongoDB API with db4 backend
+# - dotdo-mongodb: MongoDB API with PostgreSQL backend
+# - sdb: Document/graph database
+#
+# Uses staged datasets from R2:
+# - ecommerce: customers, products, orders, reviews
+# - saas: orgs, users, workspaces, documents
+# - social: users, posts, comments, likes, follows
+#
+# Dataset sizes: 1mb, 10mb, 100mb, 1gb
+#
+# Benchmark operations:
+# - point_lookup: Single record fetch by ID
+# - range_scan: Filtered query with limit
+# - single_insert: Insert one record
+# - batch_insert: Insert 100 records
+# - update: Update existing record
+# - delete: Delete record
+# - transaction: Multi-operation transaction
+#
+# Deploy: wrangler deploy -c worker/bench-oltp.wrangler.toml
+
+name = "bench-oltp"
+main = "bench-oltp.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable logpush for benchmark analysis
+logpush = true
+
+# Worker limits - OLTP benchmarks can run for extended periods
+[limits]
+cpu_ms = 60000  # 60 seconds for larger datasets
+
+# Development settings
+[dev]
+port = 8790
+local_protocol = "http"
+
+# ==============================================================================
+# Durable Object Bindings
+# ==============================================================================
+# Each database type gets its own DO class for isolation and independent scaling.
+# DOs provide consistent state for loading datasets and running benchmarks.
+
+# DB4 - Pure TypeScript document store
+[[durable_objects.bindings]]
+name = "DB4_DO"
+class_name = "OLTPBenchDO"
+
+# EvoDB - Event-sourced document store
+[[durable_objects.bindings]]
+name = "EVODB_DO"
+class_name = "OLTPBenchDO"
+
+# PostgreSQL - PGLite WASM
+[[durable_objects.bindings]]
+name = "POSTGRES_DO"
+class_name = "OLTPBenchDO"
+
+# SQLite - libsql WASM
+[[durable_objects.bindings]]
+name = "SQLITE_DO"
+class_name = "OLTPBenchDO"
+
+# @db4/mongo - MongoDB API with db4 backend
+[[durable_objects.bindings]]
+name = "DB4_MONGO_DO"
+class_name = "OLTPBenchDO"
+
+# @dotdo/mongodb - MongoDB API with PostgreSQL backend
+[[durable_objects.bindings]]
+name = "DOTDO_MONGODB_DO"
+class_name = "OLTPBenchDO"
+
+# SDB - Document/graph database
+[[durable_objects.bindings]]
+name = "SDB_DO"
+class_name = "OLTPBenchDO"
+
+# Durable Object migration for SQLite storage
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["OLTPBenchDO"]
+
+# ==============================================================================
+# R2 Storage Bindings
+# ==============================================================================
+
+# Datasets bucket - contains staged OLTP data from stage-oltp worker
+[[r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets"
+# preview_bucket_name = "oltp-datasets-preview"
+
+# Results bucket - stores benchmark output as JSONL
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results"
+preview_bucket_name = "bench-results-preview"
+
+# ==============================================================================
+# Environment Variables
+# ==============================================================================
+
+[vars]
+ENVIRONMENT = "worker"
+BENCHMARK_TYPE = "oltp"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+# Production environment
+[env.production]
+name = "bench-oltp"
+route = { pattern = "bench.dotdo.workers.dev/benchmark/oltp*", zone_name = "dotdo.workers.dev" }
+
+[[env.production.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-prod"
+
+[[env.production.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-prod"
+
+# Staging environment
+[env.staging]
+name = "bench-oltp-staging"
+
+[[env.staging.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-staging"
+
+[[env.staging.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-staging"
+
+# Development environment
+[env.dev]
+name = "bench-oltp-dev"
+vars = { ENVIRONMENT = "development" }
+
+[[env.dev.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-dev"
+
+[[env.dev.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-dev"
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ==============================================================================
+# Build configuration
+# ==============================================================================
+
+[build]
+command = ""
+
+[build.upload]
+format = "modules"
+main = "./bench-oltp.ts"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.ts"]
+
+# ==============================================================================
+# Placement (optional - for specific region targeting)
+# ==============================================================================
+
+# Uncomment to pin to specific region for consistent benchmarking
+# [placement]
+# mode = "smart"
+# hint = "iad"  # Ashburn, Virginia (US East)
+
+# ==============================================================================
+# Usage Notes
+# ==============================================================================
+
+# Prerequisites:
+#
+# 1. Create the R2 buckets:
+#    wrangler r2 bucket create oltp-datasets
+#    wrangler r2 bucket create bench-results
+#
+# 2. Stage datasets using stage-oltp worker:
+#    curl -X POST "https://stage-oltp.workers.dev/stage/ecommerce/10mb"
+#    curl -X POST "https://stage-oltp.workers.dev/stage/saas/10mb"
+#    curl -X POST "https://stage-oltp.workers.dev/stage/social/10mb"
+#
+# Deployment:
+#
+# 1. Deploy the worker:
+#    wrangler deploy --config worker/bench-oltp.wrangler.toml
+#
+# 2. Deploy to specific environment:
+#    wrangler deploy --config worker/bench-oltp.wrangler.toml --env production
+#
+# Usage:
+#
+# 1. Run benchmark for specific database/dataset/size:
+#    curl -X POST "https://bench-oltp.workers.dev/benchmark/oltp?database=db4&dataset=ecommerce&size=10mb"
+#
+# 2. Run benchmark with custom operations:
+#    curl -X POST "https://bench-oltp.workers.dev/benchmark/oltp?database=postgres&dataset=saas&size=100mb" \
+#      -H "Content-Type: application/json" \
+#      -d '{"operations": ["point_lookup", "range_scan"], "iterations": 500}'
+#
+# 3. Run batch benchmark across all databases:
+#    curl -X POST "https://bench-oltp.workers.dev/benchmark/oltp/batch?dataset=ecommerce&size=10mb"
+#
+# 4. List available options:
+#    curl "https://bench-oltp.workers.dev/benchmark/oltp/options"
+#
+# 5. Check dataset availability:
+#    curl "https://bench-oltp.workers.dev/benchmark/oltp/datasets"
+#
+# 6. List stored results:
+#    curl "https://bench-oltp.workers.dev/benchmark/oltp/results"
+#    curl "https://bench-oltp.workers.dev/benchmark/oltp/results?database=db4"
+#
+# 7. Get specific result:
+#    curl "https://bench-oltp.workers.dev/benchmark/oltp/results/oltp-abc123"
+#
+# Response Format:
+#
+# The benchmark returns JSON with the following structure:
+# {
+#   "runId": "oltp-abc123-def456",
+#   "database": "db4",
+#   "dataset": "ecommerce",
+#   "size": "10mb",
+#   "timestamp": "2026-01-21T00:00:00.000Z",
+#   "environment": "do",
+#   "colo": "SJC",
+#   "benchmarks": [
+#     {
+#       "name": "point_lookup",
+#       "iterations": 100,
+#       "totalMs": 150.5,
+#       "minMs": 0.8,
+#       "maxMs": 5.2,
+#       "meanMs": 1.505,
+#       "stddevMs": 0.65,
+#       "p50Ms": 1.2,
+#       "p99Ms": 4.8,
+#       "opsPerSec": 664.45
+#     },
+#     ...
+#   ],
+#   "datasetStats": {
+#     "tablesLoaded": ["customers", "products", "orders", "reviews"],
+#     "totalRecords": 12500,
+#     "loadTimeMs": 2500
+#   },
+#   "summary": {
+#     "totalDurationMs": 15000,
+#     "totalOperations": 500,
+#     "overallOpsPerSec": 33.33
+#   }
+# }
+#
+# Results are also stored in R2 as JSONL at:
+# bench-results/oltp/{database}/{dataset}/{size}/{runId}.jsonl
+#
+# JSONL Format (one line per operation):
+# {"benchmark":"oltp/point_lookup","database":"db4","dataset":"ecommerce-10mb",...}
+#
+# Supported Databases:
+#
+# | Database      | Type                  | WASM | Transactions |
+# |---------------|----------------------|------|--------------|
+# | db4           | Document store       | No   | No           |
+# | evodb         | Event-sourced        | No   | Atomic       |
+# | postgres      | SQL (PGLite)         | Yes  | Yes          |
+# | sqlite        | SQL (libsql)         | Yes  | Yes          |
+# | db4-mongo     | MongoDB API + db4    | No   | No           |
+# | dotdo-mongodb | MongoDB API + PG     | Yes  | Yes          |
+# | sdb           | Document/Graph       | No   | Batch        |
+#
+# Performance Considerations:
+#
+# - Cold start: WASM databases (postgres, sqlite, dotdo-mongodb) have longer
+#   cold start times due to WASM instantiation
+# - Dataset size: Larger datasets (100mb, 1gb) require more memory and
+#   longer load times
+# - Batch operations: batch_insert tests 100 records per iteration
+# - Transaction overhead: Varies by database implementation
+#
+# Typical Results (10mb dataset, SJC colo):
+#
+# | Database      | point_lookup p50 | range_scan p50 | insert p50 |
+# |---------------|-----------------|----------------|------------|
+# | db4           | ~0.5ms          | ~2ms           | ~0.3ms     |
+# | evodb         | ~0.6ms          | ~2.5ms         | ~0.4ms     |
+# | postgres      | ~1.2ms          | ~5ms           | ~0.8ms     |
+# | sqlite        | ~0.8ms          | ~3ms           | ~0.5ms     |
+# | db4-mongo     | ~0.7ms          | ~3ms           | ~0.5ms     |
+# | dotdo-mongodb | ~1.5ms          | ~6ms           | ~1ms       |
+# | sdb           | ~0.6ms          | ~2.5ms         | ~0.4ms     |

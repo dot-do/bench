@@ -1,0 +1,268 @@
+# Analytics Benchmark Worker - ClickBench Suite
+#
+# Runs the ClickBench 43 queries against analytical databases:
+# - DuckDB (columnar OLAP, best for analytics)
+# - PostgreSQL (PGLite WASM)
+# - SQLite (sql.js WASM)
+#
+# Uses analytics datasets from R2:
+# - clickbench/hits.parquet (~14GB, 99M rows)
+# - imdb/* (movie/TV datasets)
+#
+# Benchmarks:
+# - Full table scans
+# - Aggregations (COUNT, SUM, AVG, MIN, MAX)
+# - Complex GROUP BY with ORDER BY
+# - High-cardinality string operations
+# - Filter + aggregate combinations
+#
+# Deploy: wrangler deploy -c worker/bench-analytics.wrangler.toml
+#
+# @see https://github.com/ClickHouse/ClickBench
+# @see datasets/analytics/clickbench.ts
+
+name = "bench-analytics"
+main = "bench-analytics.ts"
+compatibility_date = "2025-01-21"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable logpush for benchmark analysis
+logpush = true
+
+# Worker limits - analytics queries can be slow
+[limits]
+cpu_ms = 30000  # 30 seconds for complex queries on large datasets
+
+# Development settings
+[dev]
+port = 8790
+local_protocol = "http"
+
+# ==============================================================================
+# R2 Storage Bindings
+# ==============================================================================
+
+# Analytics datasets bucket (clickbench hits.parquet, imdb data)
+[[r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets"
+preview_bucket_name = "analytics-datasets-preview"
+
+# Results bucket for storing benchmark output as JSONL
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results"
+preview_bucket_name = "bench-results-preview"
+
+# Bucket structure:
+# analytics-datasets/
+#   analytics/
+#     clickbench/
+#       hits.parquet               # ~14 GB ClickBench data (99M rows)
+#     imdb/
+#       title.basics.tsv           # ~700 MB movie/show titles
+#       name.basics.tsv            # ~800 MB names (actors, directors, etc.)
+#       title.ratings.tsv          # ~25 MB ratings data
+#
+# bench-results/
+#   analytics/
+#     duckdb/
+#       analytics-{timestamp}-{random}.jsonl
+#     postgres/
+#       analytics-{timestamp}-{random}.jsonl
+#     sqlite/
+#       analytics-{timestamp}-{random}.jsonl
+
+# ==============================================================================
+# Environment Variables
+# ==============================================================================
+
+[vars]
+ENVIRONMENT = "worker"
+BENCHMARK_TYPE = "analytics"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+# Production environment
+[env.production]
+name = "bench-analytics"
+route = { pattern = "bench.dotdo.workers.dev/benchmark/analytics*", zone_name = "dotdo.workers.dev" }
+
+[[env.production.r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets-prod"
+
+[[env.production.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-prod"
+
+# Staging environment
+[env.staging]
+name = "bench-analytics-staging"
+
+[[env.staging.r2_buckets]]
+binding = "ANALYTICS_BUCKET"
+bucket_name = "analytics-datasets-staging"
+
+[[env.staging.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-staging"
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ==============================================================================
+# Build configuration
+# ==============================================================================
+
+[build]
+command = ""
+
+[build.upload]
+format = "modules"
+main = "./bench-analytics.ts"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.ts"]
+
+# ==============================================================================
+# Placement (optional - for specific region targeting)
+# ==============================================================================
+
+# Uncomment to pin to specific region for consistent benchmarking
+# [placement]
+# mode = "smart"
+# hint = "iad"  # Ashburn, Virginia (US East)
+
+# ==============================================================================
+# Deployment Notes
+# ==============================================================================
+
+# Prerequisites:
+#
+# 1. Create the R2 buckets:
+#    wrangler r2 bucket create analytics-datasets
+#    wrangler r2 bucket create bench-results
+#
+# 2. Stage the ClickBench dataset using stage-analytics worker:
+#    curl -X POST "https://stage-analytics.workers.dev/stage/clickbench"
+#
+#    Or manually download and upload:
+#    curl -O https://datasets.clickhouse.com/hits_compatible/hits.parquet
+#    wrangler r2 object put analytics-datasets/analytics/clickbench/hits.parquet --file=hits.parquet
+#
+# 3. (Optional) Stage IMDB dataset:
+#    curl -X POST "https://stage-analytics.workers.dev/stage/imdb"
+#
+# Deployment:
+#
+# 1. Deploy the worker:
+#    wrangler deploy --config worker/bench-analytics.wrangler.toml
+#
+# 2. Deploy to staging:
+#    wrangler deploy --config worker/bench-analytics.wrangler.toml --env staging
+#
+# Usage:
+#
+# 1. Run full ClickBench suite with DuckDB:
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?database=duckdb&dataset=clickbench"
+#
+# 2. Run simple queries only (faster):
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?database=duckdb&complexity=simple"
+#
+# 3. Run specific queries:
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?queries=q0,q1,q4,q10"
+#
+# 4. Compare databases:
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?database=postgres"
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?database=sqlite"
+#    curl -X POST "https://bench-analytics.workers.dev/benchmark/analytics?database=duckdb"
+#
+# 5. List available queries:
+#    curl "https://bench-analytics.workers.dev/queries"
+#
+# 6. List benchmark results:
+#    curl "https://bench-analytics.workers.dev/benchmark/analytics/results"
+#
+# 7. Get specific result:
+#    curl "https://bench-analytics.workers.dev/benchmark/analytics/results/{runId}?database=duckdb"
+#
+# Query Parameters:
+#
+# - database: postgres, sqlite, duckdb (default: duckdb)
+# - dataset: clickbench, imdb (default: clickbench)
+# - iterations: 1-100 (default: 3)
+# - complexity: simple, moderate, complex, expert (optional filter)
+# - queries: comma-separated query IDs like q0,q1,q2 (optional filter)
+#
+# Query Complexity Breakdown:
+#
+# Simple (Q0-Q9): Basic aggregations, single filters
+#   - COUNT(*), SUM, AVG, MIN, MAX
+#   - Single predicate filters
+#   - Expected: <100ms per query on warm data
+#
+# Moderate (Q10-Q19): GROUP BY queries
+#   - GROUP BY with ORDER BY
+#   - Multiple aggregates per group
+#   - Expected: 100ms-500ms per query
+#
+# Complex (Q20-Q32): Advanced analytics
+#   - High-cardinality string grouping
+#   - Multiple filter conditions
+#   - Expected: 500ms-2s per query
+#
+# Expert (Q33-Q42): Production patterns
+#   - Funnel analysis
+#   - Cohort/retention queries
+#   - HAVING clauses
+#   - Expected: 1-5s per query
+#
+# Performance Notes:
+#
+# DuckDB (recommended):
+#   - Best for columnar analytics
+#   - Native Parquet support
+#   - Vectorized execution
+#   - Cold start: ~200ms
+#   - Simple query: <50ms
+#   - Complex query: <2s
+#
+# PostgreSQL (PGLite):
+#   - Row-oriented storage
+#   - Good for mixed workloads
+#   - Cold start: ~300ms
+#   - Simple query: <200ms
+#   - Complex query: 2-10s
+#
+# SQLite (sql.js):
+#   - Smallest footprint
+#   - Not optimized for analytics
+#   - Cold start: ~100ms
+#   - Simple query: <500ms
+#   - Complex query: 5-30s
+#
+# Memory Requirements:
+#
+# With 10K sample rows (default):
+#   - DuckDB: ~50MB
+#   - PostgreSQL: ~30MB
+#   - SQLite: ~20MB
+#
+# With full ClickBench (99M rows):
+#   - DuckDB: ~2GB (streams from Parquet)
+#   - PostgreSQL: N/A (too large for in-memory)
+#   - SQLite: N/A (too large for in-memory)
+#
+# For full dataset testing, use DuckDB with R2 Parquet streaming.

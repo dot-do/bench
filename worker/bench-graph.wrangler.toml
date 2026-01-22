@@ -1,0 +1,145 @@
+# Wrangler configuration for Graph Benchmark Worker
+#
+# This worker runs graph database benchmarks across:
+# - GraphDB (triple store with DO)
+# - SDB (document/graph hybrid with DO)
+# - db4 (pure TypeScript document store)
+#
+# Benchmark operations:
+# - 1-hop and 2-hop traversal
+# - Path queries
+# - Reverse traversal (backlinks)
+# - Pattern matching
+#
+# Deploy: wrangler deploy -c worker/bench-graph.wrangler.toml
+
+name = "bench-graph"
+main = "bench-graph.ts"
+compatibility_date = "2025-01-21"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable logpush for benchmark analysis
+logpush = true
+
+# Worker limits
+[limits]
+cpu_ms = 30000  # 30 seconds for complex graph traversals
+
+# Development settings
+[dev]
+port = 8789
+local_protocol = "http"
+
+# ==============================================================================
+# Durable Object Bindings
+# ==============================================================================
+# GraphDB Benchmark DO manages triple store state for graph benchmarks.
+
+[[durable_objects.bindings]]
+name = "GRAPHDB_DO"
+class_name = "GraphBenchDO"
+
+# SDB Benchmark DO manages document/graph hybrid state.
+[[durable_objects.bindings]]
+name = "SDB_DO"
+class_name = "SDBBenchDO"
+
+# Durable Object migrations for SQLite storage
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GraphBenchDO", "SDBBenchDO"]
+
+# ==============================================================================
+# R2 Storage
+# ==============================================================================
+# DATA bucket for graph datasets (wikidata subset, social network data)
+
+[[r2_buckets]]
+binding = "DATA"
+bucket_name = "bench-graph-data"
+preview_bucket_name = "bench-graph-data-preview"
+
+# RESULTS bucket for storing benchmark output as JSONL
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results"
+preview_bucket_name = "bench-results-preview"
+
+# ==============================================================================
+# Environment Variables
+# ==============================================================================
+
+[vars]
+ENVIRONMENT = "worker"
+BENCHMARK_TYPE = "graph"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+# Production environment
+[env.production]
+name = "bench-graph"
+route = { pattern = "bench.dotdo.workers.dev/benchmark/graph*", zone_name = "dotdo.workers.dev" }
+
+[[env.production.r2_buckets]]
+binding = "DATA"
+bucket_name = "bench-graph-data-prod"
+
+[[env.production.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-prod"
+
+# Staging environment
+[env.staging]
+name = "bench-graph-staging"
+
+[[env.staging.r2_buckets]]
+binding = "DATA"
+bucket_name = "bench-graph-data-staging"
+
+[[env.staging.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-staging"
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ==============================================================================
+# Build configuration
+# ==============================================================================
+
+[build]
+command = ""
+
+[build.upload]
+format = "modules"
+main = "./bench-graph.ts"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.ts"]
+
+# ==============================================================================
+# Placement (optional - for specific region targeting)
+# ==============================================================================
+
+# Uncomment to pin to specific region for consistent benchmarking
+# [placement]
+# mode = "smart"
+# hint = "iad"  # Ashburn, Virginia (US East)
+
+# ==============================================================================
+# Tail workers for real-time monitoring (optional)
+# ==============================================================================
+
+# [tail_consumers]
+# - service = "bench-analytics"

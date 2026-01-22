@@ -1,0 +1,159 @@
+# Wrangler configuration for Container vs WASM Latency Benchmark Worker
+#
+# This worker compares latency characteristics between:
+# - WASM databases running in-Worker
+# - Containerized databases running in Cloudflare Containers
+#
+# Deploy: wrangler deploy -c worker/bench-container-latency.wrangler.toml
+
+name = "bench-container-latency"
+main = "bench-container-latency.ts"
+compatibility_date = "2025-01-21"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable logpush for benchmark analysis
+logpush = true
+
+# Worker limits
+[limits]
+cpu_ms = 30000  # 30 seconds for batch benchmarks
+
+# Development settings
+[dev]
+port = 8787
+local_protocol = "http"
+
+# R2 bucket for storing benchmark results
+[[r2_buckets]]
+binding = "BENCHMARK_RESULTS"
+bucket_name = "bench-results"
+preview_bucket_name = "bench-results-preview"
+
+# ==============================================================================
+# Container Bindings
+# ==============================================================================
+# Each container runs a database with an HTTP bridge for communication.
+# Containers support different size tiers affecting performance and cost.
+#
+# Size tiers:
+# - lite:           256MB RAM, 0.25 vCPU ($0.015/hr)
+# - basic:          512MB RAM, 0.5 vCPU ($0.03/hr)
+# - standard-1:     1GB RAM, 1 vCPU ($0.06/hr)
+# - standard-2:     2GB RAM, 2 vCPU ($0.12/hr)
+# - standard-4:     4GB RAM, 4 vCPU ($0.24/hr)
+# - performance-8:  8GB RAM, 8 vCPU ($0.48/hr)
+# - performance-16: 16GB RAM, 16 vCPU ($0.96/hr)
+# ==============================================================================
+
+# PostgreSQL Container
+# Runs PostgreSQL with an HTTP REST API bridge
+[[containers]]
+binding = "POSTGRES_CONTAINER"
+class_name = "PostgresContainer"
+image = "./containers/dockerfiles/Dockerfile.postgres"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# ClickHouse Container
+# ClickHouse has native HTTP interface on port 8123
+[[containers]]
+binding = "CLICKHOUSE_CONTAINER"
+class_name = "ClickHouseContainer"
+image = "./containers/dockerfiles/Dockerfile.clickhouse"
+max_instances = 10
+default_port = 8123
+sleep_after = "10m"
+
+# MongoDB Container
+# Runs MongoDB with an HTTP REST API bridge
+[[containers]]
+binding = "MONGO_CONTAINER"
+class_name = "MongoContainer"
+image = "./containers/dockerfiles/Dockerfile.mongo"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# DuckDB Container
+# DuckDB with HTTP REST API for analytical queries
+[[containers]]
+binding = "DUCKDB_CONTAINER"
+class_name = "DuckDBContainer"
+image = "./containers/dockerfiles/Dockerfile.duckdb"
+max_instances = 10
+default_port = 9999
+sleep_after = "10m"
+
+# SQLite Container
+# SQLite with HTTP REST API bridge
+[[containers]]
+binding = "SQLITE_CONTAINER"
+class_name = "SQLiteContainer"
+image = "./containers/dockerfiles/Dockerfile.sqlite"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+# Production environment
+[env.production]
+name = "bench-container-latency"
+route = { pattern = "bench.dotdo.workers.dev/benchmark/container-latency*", zone_name = "dotdo.workers.dev" }
+
+[[env.production.r2_buckets]]
+binding = "BENCHMARK_RESULTS"
+bucket_name = "bench-results-prod"
+
+# Staging environment
+[env.staging]
+name = "bench-container-latency-staging"
+
+[[env.staging.r2_buckets]]
+binding = "BENCHMARK_RESULTS"
+bucket_name = "bench-results-staging"
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ==============================================================================
+# Build configuration
+# ==============================================================================
+
+[build]
+command = ""
+
+[build.upload]
+format = "modules"
+main = "./bench-container-latency.ts"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.ts"]
+
+# ==============================================================================
+# Placement (optional - for specific region targeting)
+# ==============================================================================
+
+# Uncomment to pin to specific region for consistent benchmarking
+# [placement]
+# mode = "smart"
+# hint = "iad"  # Ashburn, Virginia (US East)
+
+# ==============================================================================
+# Tail workers for real-time monitoring (optional)
+# ==============================================================================
+
+# [tail_consumers]
+# - service = "bench-analytics"

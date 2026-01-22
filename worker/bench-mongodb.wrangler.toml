@@ -1,0 +1,239 @@
+# Wrangler configuration for MongoDB Benchmark Worker
+#
+# This worker runs MongoDB benchmarks across 3 implementations:
+# - @db4/mongo: Pure TypeScript, zero WASM
+# - @dotdo/mongodb: PostgreSQL/DocumentDB backend (PGLite WASM)
+# - mongo-clickhouse: ClickHouse OLAP backend
+#
+# Benchmark operations:
+# - find (range queries)
+# - findOne (point lookups)
+# - insertOne / insertMany
+# - updateOne
+# - deleteOne
+# - aggregate pipeline
+# - $lookup (joins)
+#
+# Deploy: wrangler deploy -c worker/bench-mongodb.wrangler.toml
+#
+# Usage:
+#   curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb?implementation=all&dataset=ecommerce&size=100mb"
+
+name = "bench-mongodb"
+main = "bench-mongodb.ts"
+compatibility_date = "2025-01-21"
+compatibility_flags = ["nodejs_compat"]
+
+# Enable logpush for benchmark analysis
+logpush = true
+
+# ==============================================================================
+# Worker Limits
+# ==============================================================================
+# MongoDB benchmarks with large datasets require extended CPU time
+
+[limits]
+cpu_ms = 60000  # 60 seconds for comprehensive benchmark runs
+
+# ==============================================================================
+# Development Settings
+# ==============================================================================
+
+[dev]
+port = 8789
+local_protocol = "http"
+
+# ==============================================================================
+# Durable Object Bindings
+# ==============================================================================
+# MongoDB Benchmark DO manages store instances and dataset loading.
+# Uses SQLite-backed persistent storage for benchmark state.
+
+[[durable_objects.bindings]]
+name = "MONGODB_BENCH_DO"
+class_name = "MongoDBBenchDO"
+
+# Durable Object migration for SQLite storage
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MongoDBBenchDO"]
+
+# ==============================================================================
+# R2 Storage - Datasets
+# ==============================================================================
+# OLTP datasets bucket containing pre-generated JSONL files:
+# - oltp/ecommerce/{size}/orders.jsonl, customers.jsonl, etc.
+# - oltp/saas/{size}/documents.jsonl, users.jsonl, etc.
+# - oltp/social/{size}/posts.jsonl, users.jsonl, etc.
+
+[[r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets"
+# preview_bucket_name = "oltp-datasets-preview"
+
+# ==============================================================================
+# R2 Storage - Results
+# ==============================================================================
+# Results bucket for storing benchmark output as JSONL
+
+[[r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results"
+preview_bucket_name = "bench-results-preview"
+
+# ==============================================================================
+# Environment Variables
+# ==============================================================================
+
+[vars]
+ENVIRONMENT = "worker"
+BENCHMARK_TYPE = "mongodb"
+
+# ==============================================================================
+# Environment-specific configurations
+# ==============================================================================
+
+# Production environment
+[env.production]
+name = "bench-mongodb"
+route = { pattern = "bench.dotdo.workers.dev/benchmark/mongodb*", zone_name = "dotdo.workers.dev" }
+
+[[env.production.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-prod"
+
+[[env.production.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-prod"
+
+# Staging environment
+[env.staging]
+name = "bench-mongodb-staging"
+
+[[env.staging.r2_buckets]]
+binding = "DATASETS"
+bucket_name = "oltp-datasets-staging"
+
+[[env.staging.r2_buckets]]
+binding = "RESULTS"
+bucket_name = "bench-results-staging"
+
+# ==============================================================================
+# Observability
+# ==============================================================================
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# ==============================================================================
+# Build configuration
+# ==============================================================================
+
+[build]
+command = ""
+
+[build.upload]
+format = "modules"
+main = "./bench-mongodb.ts"
+
+[[build.upload.rules]]
+type = "ESModule"
+globs = ["**/*.ts"]
+
+# ==============================================================================
+# Placement (optional - for specific region targeting)
+# ==============================================================================
+
+# Uncomment to pin to specific region for consistent benchmarking
+# [placement]
+# mode = "smart"
+# hint = "iad"  # Ashburn, Virginia (US East)
+
+# ==============================================================================
+# Deployment Notes
+# ==============================================================================
+
+# Prerequisites:
+#
+# 1. Ensure R2 buckets exist:
+#    wrangler r2 bucket create oltp-datasets
+#    wrangler r2 bucket create bench-results
+#
+# 2. Stage OLTP datasets using the stage-oltp worker:
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/ecommerce/100mb"
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/saas/100mb"
+#    curl -X POST "https://stage-oltp.your-subdomain.workers.dev/stage/social/100mb"
+#
+# Deployment:
+#
+#    wrangler deploy --config worker/bench-mongodb.wrangler.toml
+#
+# Usage Examples:
+#
+# 1. Run all implementations with default settings:
+#    curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb"
+#
+# 2. Benchmark specific implementation:
+#    curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb?implementation=db4"
+#
+# 3. Use different dataset:
+#    curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb?dataset=saas&size=10mb"
+#
+# 4. Run specific operations with custom iterations:
+#    curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb" \
+#      -H "Content-Type: application/json" \
+#      -d '{"operations": ["findOne_by_id", "insertOne"], "iterations": 200}'
+#
+# 5. List all benchmark results:
+#    curl "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb/results"
+#
+# 6. Get specific result:
+#    curl "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb/results/{runId}"
+#
+# Available Operations:
+#
+# - findOne_by_id: Point lookup by _id field
+# - findOne_by_field: Point lookup by indexed field
+# - find_with_filter: Range query with filter
+# - find_with_sort: Query with sort
+# - insertOne: Single document insert
+# - insertMany: Batch insert (100 documents)
+# - updateOne: Single document update
+# - deleteOne: Single document delete
+# - aggregate_group: Aggregation with $group
+# - aggregate_lookup: Aggregation with $lookup (join)
+#
+# Implementation Notes:
+#
+# - @db4/mongo: Pure TypeScript, zero WASM overhead, fastest cold start
+#   Best for: OLTP workloads, edge computing, low-latency requirements
+#
+# - @dotdo/mongodb: Uses PGLite WASM for PostgreSQL-compatible storage
+#   Best for: Complex queries, ACID transactions, SQL compatibility
+#
+# - mongo-clickhouse: ClickHouse backend (simulated in Worker due to chdb unavailability)
+#   Best for: OLAP workloads, large scans, columnar analytics
+#
+# Result Format (JSONL):
+#
+# Each benchmark result line contains:
+# {
+#   "benchmark": "mongodb/findOne_by_id",
+#   "database": "mongodb-db4",
+#   "dataset": "ecommerce-100mb",
+#   "p50_ms": 0.5,
+#   "p99_ms": 2.3,
+#   "min_ms": 0.2,
+#   "max_ms": 5.1,
+#   "mean_ms": 0.8,
+#   "ops_per_sec": 1250,
+#   "iterations": 100,
+#   "timestamp": "2025-01-21T12:00:00.000Z",
+#   "environment": "do",
+#   "run_id": "mongodb-abc123",
+#   "colo": "SJC"
+# }

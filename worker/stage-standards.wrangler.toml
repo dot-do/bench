@@ -1,0 +1,189 @@
+# Standards Dataset Staging Worker
+#
+# Stages standards.org.ai datasets using Cloudflare Containers.
+# Fetches TSV files from GitHub, converts to multiple formats, stores in R2.
+#
+# Deploy with: wrangler deploy --config worker/stage-standards.wrangler.toml
+#
+# @see https://developers.cloudflare.com/containers/
+# @see https://github.com/dot-org-ai/standards.org.ai
+
+name = "stage-standards"
+main = "stage-standards.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers settings
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+
+# Build settings
+[build]
+command = "npx esbuild stage-standards.ts --bundle --outfile=dist/stage-standards.js --format=esm --platform=browser"
+
+# Performance settings for staging worker
+# Staging can take a long time with 200+ files
+[limits]
+cpu_ms = 600000  # 10 minutes max CPU time for full staging
+
+# Observability
+[observability]
+enabled = true
+head_sampling_rate = 1  # Full sampling for staging operations
+
+# =============================================================================
+# Container Binding - Staging Sandbox
+# =============================================================================
+
+# The staging container runs the conversion scripts in an isolated environment.
+# It has DuckDB, SQLite, and Node.js for running the conversion scripts.
+[[containers]]
+binding = "STAGING_CONTAINER"
+class_name = "StagingContainer"
+image = "./containers/dockerfiles/Dockerfile.staging"
+max_instances = 5
+default_port = 8080
+sleep_after = "30m"
+
+# Container size options (uncomment one):
+# size = "lite"           # 256MB RAM - for testing
+# size = "basic"          # 512MB RAM - light workloads
+# size = "standard-1"     # 1GB RAM   - default
+# size = "standard-2"     # 2GB RAM   - recommended for full staging
+# size = "performance-8"  # 8GB RAM   - fast parallel processing
+
+# =============================================================================
+# R2 Bucket for Staged Datasets
+# =============================================================================
+
+[[r2_buckets]]
+binding = "STANDARDS_BUCKET"
+bucket_name = "standards-datasets"
+# preview_bucket_name = "standards-datasets-preview"
+
+# Bucket structure:
+# standards-datasets/
+#   _manifest.json           # Staging manifest with last run info
+#   sqlite/
+#     ONET_occupations.db
+#     NAICS_codes.db
+#     ISO_countries.db
+#     ...
+#   jsonl/
+#     ONET_occupations.jsonl
+#     NAICS_codes.jsonl
+#     ISO_countries.jsonl
+#     ...
+#   parquet/
+#     ONET_occupations.parquet
+#     NAICS_codes.parquet
+#     ISO_countries.parquet
+#     ...
+#   triples/
+#     ONET_occupations.nt
+#     NAICS_codes.nt
+#     ISO_countries.nt
+#     ...
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "info"
+
+# Optional: GitHub token for higher API rate limits
+# Set via wrangler secret: wrangler secret put GITHUB_TOKEN
+# [secrets]
+# GITHUB_TOKEN = ""
+
+# Development environment
+[env.dev]
+vars = { ENVIRONMENT = "development", LOG_LEVEL = "debug" }
+
+[[env.dev.r2_buckets]]
+binding = "STANDARDS_BUCKET"
+bucket_name = "standards-datasets-dev"
+
+# Staging environment
+[env.staging]
+vars = { ENVIRONMENT = "staging", LOG_LEVEL = "info" }
+
+[[env.staging.r2_buckets]]
+binding = "STANDARDS_BUCKET"
+bucket_name = "standards-datasets-staging"
+
+# =============================================================================
+# Deployment Notes
+# =============================================================================
+
+# Prerequisites:
+#
+# 1. Create the R2 bucket:
+#    wrangler r2 bucket create standards-datasets
+#
+# 2. Build the staging container image (requires Docker):
+#    docker build -t staging-container -f containers/dockerfiles/Dockerfile.staging .
+#
+# 3. (Optional) Add GitHub token for higher rate limits:
+#    wrangler secret put GITHUB_TOKEN --config worker/stage-standards.wrangler.toml
+#
+# Deployment:
+#
+# 1. Deploy the worker:
+#    wrangler deploy --config worker/stage-standards.wrangler.toml
+#
+# 2. Deploy to dev environment:
+#    wrangler deploy --config worker/stage-standards.wrangler.toml --env dev
+#
+# Usage:
+#
+# 1. Stage all formats (takes ~10-30 minutes depending on container size):
+#    curl -X POST "https://stage-standards.your-subdomain.workers.dev/stage/standards"
+#
+# 2. Stage specific formats:
+#    curl -X POST "https://stage-standards.your-subdomain.workers.dev/stage/standards?format=sqlite,jsonl"
+#
+# 3. Check status:
+#    curl "https://stage-standards.your-subdomain.workers.dev/stage/standards/status"
+#
+# 4. List staged files:
+#    curl "https://stage-standards.your-subdomain.workers.dev/stage/standards/list"
+#    curl "https://stage-standards.your-subdomain.workers.dev/stage/standards/list?format=parquet"
+#
+# Dataset Categories:
+#
+# The standards.org.ai repository contains 200+ TSV files across these categories:
+# - ONET: Occupations, skills, knowledge areas, abilities
+# - NAICS/NAPCS: Industry and product classifications
+# - ISO: Countries, currencies, languages, standards
+# - W3C: Web standards (ARIA, CSS, HTML elements)
+# - Healthcare: ICD, LOINC, SNOMED, FHIR resources
+# - Finance: ISO 20022, SWIFT codes, LEI
+# - Government: Census, BLS, SBA, GSA codes
+# - Commerce: GS1, UNSPSC, EDI codes
+# - And many more...
+#
+# Output Formats:
+#
+# - sqlite/   : SQLite databases for WASM-based queries
+# - jsonl/    : JSONL files for document stores (MongoDB, @db4/mongo)
+# - parquet/  : Parquet files for DuckDB analytics
+# - triples/  : N-Triples for GraphDB/SDB
+#
+# Cost Estimation:
+#
+# Container costs depend on size and runtime:
+# - lite:       $0.0025/hr - ~$0.02 per full staging run
+# - standard-1: $0.01/hr   - ~$0.10 per full staging run
+# - standard-2: $0.02/hr   - ~$0.15 per full staging run (faster)
+#
+# R2 storage costs:
+# - Storage: $0.015/GB/month
+# - Estimated total: ~50-100MB across all formats = ~$0.002/month
+#
+# Scheduling (optional):
+#
+# To run staging on a schedule, use Cron Triggers:
+# [triggers]
+# crons = ["0 0 * * 0"]  # Weekly on Sunday at midnight UTC

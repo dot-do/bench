@@ -1,0 +1,166 @@
+# Container Throughput Benchmark Worker
+#
+# Benchmarks container database throughput and calculates costs.
+# Deploy with: wrangler deploy --config worker/bench-container-throughput.wrangler.toml
+#
+# @see https://developers.cloudflare.com/containers/
+
+name = "bench-container-throughput"
+main = "bench-container-throughput.ts"
+compatibility_date = "2026-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers settings
+account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+
+# Build settings
+[build]
+command = "npx esbuild bench-container-throughput.ts --bundle --outfile=dist/bench-container-throughput.js --format=esm --platform=browser"
+
+# Performance settings for benchmark worker
+[limits]
+cpu_ms = 300000  # 5 minutes max CPU time for long benchmarks
+
+# Routes
+# routes = [
+#   { pattern = "bench-throughput.example.com/*", zone_name = "example.com" }
+# ]
+
+# Observability
+[observability]
+enabled = true
+head_sampling_rate = 1  # Full sampling during benchmarks
+
+# =============================================================================
+# Container Bindings
+# =============================================================================
+
+# PostgreSQL Container
+[[containers]]
+binding = "POSTGRES_CONTAINER"
+class_name = "PostgresContainer"
+image = "./containers/dockerfiles/Dockerfile.postgres"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# Size can be configured per-deployment:
+# lite:         256MB RAM, 0.25 vCPU - $0.0025/hr
+# basic:        512MB RAM, 0.5 vCPU  - $0.005/hr
+# standard-1:   1GB RAM, 1 vCPU      - $0.01/hr
+# standard-2:   2GB RAM, 2 vCPU      - $0.02/hr
+# standard-4:   4GB RAM, 4 vCPU      - $0.04/hr
+# performance-8:  8GB RAM, 8 vCPU    - $0.08/hr
+# performance-16: 16GB RAM, 16 vCPU  - $0.16/hr
+
+# ClickHouse Container
+[[containers]]
+binding = "CLICKHOUSE_CONTAINER"
+class_name = "ClickHouseContainer"
+image = "./containers/dockerfiles/Dockerfile.clickhouse"
+max_instances = 10
+default_port = 8123
+sleep_after = "10m"
+
+# MongoDB Container
+[[containers]]
+binding = "MONGO_CONTAINER"
+class_name = "MongoContainer"
+image = "./containers/dockerfiles/Dockerfile.mongo"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# DuckDB Container
+[[containers]]
+binding = "DUCKDB_CONTAINER"
+class_name = "DuckDBContainer"
+image = "./containers/dockerfiles/Dockerfile.duckdb"
+max_instances = 10
+default_port = 9999
+sleep_after = "10m"
+
+# SQLite Container
+[[containers]]
+binding = "SQLITE_CONTAINER"
+class_name = "SQLiteContainer"
+image = "./containers/dockerfiles/Dockerfile.sqlite"
+max_instances = 10
+default_port = 8080
+sleep_after = "10m"
+
+# =============================================================================
+# R2 Bucket for Results
+# =============================================================================
+
+[[r2_buckets]]
+binding = "RESULTS_BUCKET"
+bucket_name = "bench-results"
+# preview_bucket_name = "bench-results-preview"
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+[vars]
+ENVIRONMENT = "production"
+LOG_LEVEL = "info"
+
+# Development environment
+[env.dev]
+vars = { ENVIRONMENT = "development", LOG_LEVEL = "debug" }
+
+[env.dev.r2_buckets]
+binding = "RESULTS_BUCKET"
+bucket_name = "bench-results-dev"
+
+# Staging environment
+[env.staging]
+vars = { ENVIRONMENT = "staging", LOG_LEVEL = "info" }
+
+[env.staging.r2_buckets]
+binding = "RESULTS_BUCKET"
+bucket_name = "bench-results-staging"
+
+# =============================================================================
+# Deployment Notes
+# =============================================================================
+
+# To deploy this worker:
+#
+# 1. Create the R2 bucket:
+#    wrangler r2 bucket create bench-results
+#
+# 2. Build and deploy:
+#    wrangler deploy --config worker/bench-container-throughput.wrangler.toml
+#
+# 3. Run a benchmark:
+#    curl -X POST "https://bench-container-throughput.your-subdomain.workers.dev/benchmark/container-throughput?database=postgres&concurrency=50&duration=60"
+#
+# 4. Run a quick test:
+#    curl "https://bench-container-throughput.your-subdomain.workers.dev/benchmark/container-throughput/quick?database=postgres"
+#
+# Container size selection:
+# - Use 'lite' or 'basic' for development/testing
+# - Use 'standard-1' or 'standard-2' for production
+# - Use 'performance-*' for high-throughput requirements
+#
+# Cost estimation at different scales:
+#
+# | Container Size  | Hourly Cost | 1M ops/mo | 100M ops/mo | 1B ops/mo |
+# |-----------------|-------------|-----------|-------------|-----------|
+# | lite            | $0.0025     | ~$1.80    | ~$180       | ~$1,800   |
+# | basic           | $0.005      | ~$3.60    | ~$360       | ~$3,600   |
+# | standard-1      | $0.01       | ~$7.20    | ~$720       | ~$7,200   |
+# | standard-2      | $0.02       | ~$14.40   | ~$1,440     | ~$14,400  |
+# | performance-8   | $0.08       | ~$57.60   | ~$5,760     | ~$57,600  |
+#
+# Compare with WASM + DO (2MB blob optimization):
+# - Read: $0.001 per 1M rows (packed)
+# - Write: $1.00 per 1M rows (packed)
+# - At 100x packing: ~$0.01 per 1M ops
+#
+# Break-even analysis:
+# - Low volume (<10K ops/hr): WASM + DO wins
+# - Medium volume (10K-100K ops/hr): Depends on workload
+# - High volume (>100K ops/hr): Container often wins
