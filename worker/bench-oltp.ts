@@ -267,12 +267,13 @@ class DB4Adapter implements DatabaseAdapter {
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    return (await this.db!.list(collection, { where: filter, limit })) as Document[]
+    return (await this.db!.list(collection, { where: filter, limit })) as unknown as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
     const id = this.normalizeId(doc)
-    await this.db!.set(collection, id, doc as Parameters<typeof this.db!.set>[2])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await this.db!.set(collection, id, doc as any)
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
@@ -284,7 +285,8 @@ class DB4Adapter implements DatabaseAdapter {
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const existing = await this.pointLookup(collection, id)
     if (existing) {
-      await this.db!.set(collection, id, { ...existing, ...updates } as Parameters<typeof this.db!.set>[2])
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await this.db!.set(collection, id, { ...existing, ...updates } as any)
     }
   }
 
@@ -338,12 +340,13 @@ class EvoDBAdapter implements DatabaseAdapter {
     for (const [key, value] of Object.entries(filter)) {
       query = query.where(key, '=', value)
     }
-    return (await query.limit(limit).all()) as Document[]
+    return (await query.limit(limit).all()) as unknown as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
     const id = this.normalizeId(doc)
-    await this.db!.set(collection, id, doc as Parameters<typeof this.db!.set>[2])
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await this.db!.set(collection, id, doc as any)
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
@@ -355,7 +358,8 @@ class EvoDBAdapter implements DatabaseAdapter {
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const existing = await this.pointLookup(collection, id)
     if (existing) {
-      await this.db!.set(collection, id, { ...existing, ...updates } as Parameters<typeof this.db!.set>[2])
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await this.db!.set(collection, id, { ...existing, ...updates } as any)
     }
   }
 
@@ -693,7 +697,7 @@ class DB4MongoAdapter implements DatabaseAdapter {
 
   async getCollectionIds(collection: string): Promise<string[]> {
     const docs = await this.db!.collection(collection).find({}).limit(10000).toArray()
-    return docs.map((d) => (d._id ?? '') as string)
+    return docs.map((d: Document) => (d._id ?? '') as string)
   }
 }
 
@@ -766,7 +770,7 @@ class DotDoMongoDBAdapter implements DatabaseAdapter {
 
   async getCollectionIds(collection: string): Promise<string[]> {
     const docs = await this.db!.collection(collection).find({}).limit(10000).toArray()
-    return docs.map((d) => (d._id ?? '') as string)
+    return docs.map((d: Document) => (d._id ?? '') as string)
   }
 }
 

@@ -198,15 +198,9 @@ async function getDB4Store(): Promise<DB4Store> {
       db4AccountIds.push(id)
       await db4Store.set('accounts', id, {
         name: `Account ${i}`,
-        ledger: 1,
-        code: 1001,
-        debits_pending: 0,
-        debits_posted: 0,
-        credits_pending: 0,
-        credits_posted: 10000 * 100, // $10,000 initial balance
         status: 'active',
         created_at: new Date().toISOString(),
-      })
+      } as Omit<import('../databases/db4').Thing, 'id'>)
     }
   }
   return db4Store
@@ -270,15 +264,9 @@ describe('Financial - Account Creation (Single)', () => {
       const id = generateUUID()
       await store.set('accounts', id, {
         name: `Account ${id}`,
-        ledger: 1,
-        code: 1001,
-        debits_pending: 0,
-        debits_posted: 0,
-        credits_pending: 0,
-        credits_posted: 0,
         status: 'active',
         created_at: new Date().toISOString(),
-      })
+      } as Omit<import('../databases/db4').Thing, 'id'>)
     },
     { iterations: ITERATIONS.single }
   )
@@ -338,15 +326,9 @@ describe('Financial - Account Creation (Batch 1000)', () => {
         promises.push(
           store.set('accounts', id, {
             name: `Account ${id}`,
-            ledger: 1,
-            code: 1001,
-            debits_pending: 0,
-            debits_posted: 0,
-            credits_pending: 0,
-            credits_posted: 0,
             status: 'active',
             created_at: new Date().toISOString(),
-          })
+          } as Omit<import('../databases/db4').Thing, 'id'>)
         )
       }
       await Promise.all(promises)

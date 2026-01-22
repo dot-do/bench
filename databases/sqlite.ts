@@ -79,9 +79,9 @@ export async function createSQLiteStore(): Promise<SQLiteStore> {
     async transaction<T>(fn: (tx: SQLiteStore) => Promise<T>): Promise<T> {
       return db.transaction(async (tx) => {
         const txStore: SQLiteStore = {
-          query: async (sql, params) => {
+          query: async <R = unknown>(sql: string, params?: unknown[]): Promise<QueryResult<R>> => {
             const result = await (tx as typeof db).execute(sql, params)
-            return result
+            return result as QueryResult<R>
           },
           batch: async (statements) => {
             return (tx as typeof db).batch(statements.map((s) => ({ sql: s.sql, args: s.params })))

@@ -55,11 +55,11 @@ export async function createDB4Store(): Promise<DB4Store> {
 
   return {
     async get(collection: string, id: string): Promise<Thing | null> {
-      return db.get(collection, id)
+      return db.get<Thing>(collection, id)
     },
 
     async list(collection: string, options?: QueryOptions): Promise<Thing[]> {
-      return db.list(collection, options)
+      return db.list<Thing>(collection, options)
     },
 
     async count(collection: string, options?: QueryOptions): Promise<number> {

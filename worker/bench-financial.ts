@@ -200,7 +200,7 @@ export class TigerBeetleBenchDO extends DurableObject<Env> {
         id: bankAccountId,
         ledger: 1,
         code: 1001,
-        flags: AccountFlags.None,
+        flags: AccountFlags.NONE,
       },
     ]
 
@@ -673,7 +673,7 @@ export default {
     // List stored results
     if (request.method === 'GET' && url.pathname === '/benchmark/financial/results') {
       const list = await env.RESULTS.list({ prefix: 'financial/' })
-      const results = list.objects.map((obj) => ({
+      const results = list.objects.map((obj: R2Object) => ({
         key: obj.key,
         size: obj.size,
         uploaded: obj.uploaded.toISOString(),

@@ -621,8 +621,8 @@ export async function createGraphClient(wsUrl: string): Promise<GraphDBStore> {
 
     async getTriples(subject: string): Promise<Triple[]> {
       const result = await client.query(`subject:${subject}`)
-      if ('entities' in result) {
-        return result.entities.map((e: Entity) => ({
+      if (result && 'entities' in result) {
+        return (result as { entities: Entity[] }).entities.map((e: Entity) => ({
           subject: e.$id,
           predicate: (e as Record<string, unknown>)['predicate'] as string,
           object: (e as Record<string, unknown>)['object'] as TypedObject,
@@ -655,7 +655,7 @@ export async function createGraphClient(wsUrl: string): Promise<GraphDBStore> {
 
     async query(queryString: string): Promise<QueryResult> {
       const result = await client.query(queryString)
-      if ('entities' in result) {
+      if (result && 'entities' in result) {
         return result as QueryResult
       }
       return {

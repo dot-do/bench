@@ -60,6 +60,7 @@ export interface Thing {
   metadata?: Record<string, unknown>
   created_at: Date
   updated_at?: Date
+  [key: string]: unknown // Index signature for Document compatibility
 }
 
 export interface Relationship {
@@ -69,6 +70,7 @@ export interface Relationship {
   object: string
   weight?: number
   created_at: Date
+  [key: string]: unknown // Index signature for Document compatibility
 }
 
 /**
@@ -179,7 +181,7 @@ async function createClickHouseConnection(): Promise<ClickHouseConnection> {
         }
         // JSONEachRow returns newline-separated JSON objects
         const lines = result.trim().split('\n').filter(Boolean)
-        return lines.map(line => JSON.parse(line) as T)
+        return lines.map((line: string) => JSON.parse(line) as T)
       },
 
       async execute(sql: string): Promise<void> {
@@ -278,8 +280,10 @@ function createInMemoryClickHouseSimulation(): ClickHouseConnection {
             const field = orderMatch[1]
             const desc = orderMatch[2]?.toUpperCase() === 'DESC'
             rows.sort((a, b) => {
-              const aVal = a[field]
-              const bVal = b[field]
+              const aVal = a[field] as string | number | boolean | null | undefined
+              const bVal = b[field] as string | number | boolean | null | undefined
+              if (aVal === undefined || aVal === null) return desc ? -1 : 1
+              if (bVal === undefined || bVal === null) return desc ? 1 : -1
               if (aVal < bVal) return desc ? 1 : -1
               if (aVal > bVal) return desc ? -1 : 1
               return 0
@@ -977,12 +981,13 @@ export async function createMongoClickHouseStore(): Promise<MongoClickHouseStore
       delete insertDoc._id
 
       // Convert to ClickHouse INSERT format
+      const docWithId = insertDoc as Record<string, unknown>
       const jsonRow = JSON.stringify({
-        ...insertDoc,
-        tags: insertDoc.tags || [],
-        metadata: typeof insertDoc.metadata === 'object' ? JSON.stringify(insertDoc.metadata) : '{}',
-        created_at: insertDoc.created_at instanceof Date ? insertDoc.created_at.toISOString() : insertDoc.created_at || new Date().toISOString(),
-        updated_at: insertDoc.updated_at instanceof Date ? insertDoc.updated_at.toISOString() : insertDoc.updated_at || null,
+        ...docWithId,
+        tags: docWithId.tags || [],
+        metadata: typeof docWithId.metadata === 'object' ? JSON.stringify(docWithId.metadata) : '{}',
+        created_at: docWithId.created_at instanceof Date ? (docWithId.created_at as Date).toISOString() : docWithId.created_at || new Date().toISOString(),
+        updated_at: docWithId.updated_at instanceof Date ? (docWithId.updated_at as Date).toISOString() : docWithId.updated_at || null,
       })
 
       await clickhouseDb!.execute(`INSERT INTO ${collection} FORMAT JSONEachRow ${jsonRow}`)

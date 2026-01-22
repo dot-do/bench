@@ -57,7 +57,7 @@ export async function createEvoDBStore(): Promise<EvoDBStore> {
 
   return {
     async get(collection: string, id: string): Promise<Thing | null> {
-      return db.get(collection, id)
+      return db.get<Thing>(collection, id)
     },
 
     async set(collection: string, id: string, data: Omit<Thing, 'id'>): Promise<void> {
@@ -69,7 +69,7 @@ export async function createEvoDBStore(): Promise<EvoDBStore> {
     },
 
     query<T = Thing>(collection: string): QueryBuilder<T> {
-      return db.query<T>(collection)
+      return db.query<T>(collection) as QueryBuilder<T>
     },
 
     async close(): Promise<void> {

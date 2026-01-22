@@ -322,8 +322,8 @@ function createInMemoryMongoStore(): MongoStore {
             if (sortSpec) {
               const [field, dir] = Object.entries(sortSpec)[0]
               r.sort((a, b) => {
-                const aVal = a[field]
-                const bVal = b[field]
+                const aVal = a[field] as string | number
+                const bVal = b[field] as string | number
                 if (aVal < bVal) return dir === -1 ? 1 : -1
                 if (aVal > bVal) return dir === -1 ? -1 : 1
                 return 0
@@ -445,8 +445,8 @@ function createInMemoryMongoStore(): MongoStore {
                   const sortParams = params as Record<string, 1 | -1>
                   const [field, dir] = Object.entries(sortParams)[0]
                   results.sort((a, b) => {
-                    const aVal = a[field]
-                    const bVal = b[field]
+                    const aVal = a[field] as string | number
+                    const bVal = b[field] as string | number
                     if (aVal < bVal) return dir === -1 ? 1 : -1
                     if (aVal > bVal) return dir === -1 ? -1 : 1
                     return 0
@@ -480,7 +480,7 @@ function createInMemoryMongoStore(): MongoStore {
                   }
 
                   results = Array.from(groups.values()).map((group) => {
-                    const result: Document = { _id: group._id }
+                    const result: Document = { _id: group._id as string | undefined }
 
                     for (const [alias, aggOp] of Object.entries(groupParams)) {
                       if (alias === '_id') continue
@@ -576,10 +576,6 @@ export class MongoDBBenchDO extends DurableObject<Env> {
   private stores: Map<ImplementationType, MongoStore> = new Map()
   private dataLoaded: Map<string, boolean> = new Map()
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env)
-  }
-
   /**
    * Load dataset from R2 into the store
    */
@@ -603,7 +599,7 @@ export class MongoDBBenchDO extends DurableObject<Env> {
       const docs = content
         .split('\n')
         .filter(Boolean)
-        .map((line) => JSON.parse(line))
+        .map((line: string) => JSON.parse(line))
       const col = store.collection(collections.primary)
       if (docs.length > 0) {
         // Insert in batches
@@ -625,7 +621,7 @@ export class MongoDBBenchDO extends DurableObject<Env> {
       const docs = content
         .split('\n')
         .filter(Boolean)
-        .map((line) => JSON.parse(line))
+        .map((line: string) => JSON.parse(line))
       const col = store.collection(collections.secondary)
       if (docs.length > 0) {
         for (let i = 0; i < docs.length; i += 1000) {
@@ -1128,7 +1124,7 @@ export default {
     // List stored results
     if (request.method === 'GET' && url.pathname === '/benchmark/mongodb/results') {
       const list = await env.RESULTS.list({ prefix: 'mongodb/' })
-      const results = list.objects.map((obj) => ({
+      const results = list.objects.map((obj: R2Object) => ({
         key: obj.key,
         size: obj.size,
         uploaded: obj.uploaded.toISOString(),

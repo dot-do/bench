@@ -610,11 +610,11 @@ async function createDuckDBAdapter(
 ): Promise<DatabaseAdapter> {
   // Dynamic import DuckDB WASM
   // Use @dotdo/duckdb if available, fallback to @duckdb/duckdb-wasm
-  const duckdb = await import('@dotdo/duckdb').catch(() => import('@duckdb/duckdb-wasm'))
+  const duckdb = await import('@dotdo/duckdb').catch(() => import('@duckdb/duckdb-wasm')) as typeof import('@dotdo/duckdb')
 
   // Initialize DuckDB
   const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles()
-  const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES)
+  const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES as Parameters<typeof duckdb.selectBundle>[0])
 
   const worker_url = URL.createObjectURL(
     new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'text/javascript' })
@@ -623,7 +623,7 @@ async function createDuckDBAdapter(
   const worker = new Worker(worker_url)
   const logger = new duckdb.ConsoleLogger()
   const db = new duckdb.AsyncDuckDB(logger, worker)
-  await db.instantiate(bundle.mainModule, bundle.pthreadWorker)
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker as string)
 
   const conn = await db.connect()
 
@@ -755,7 +755,7 @@ async function createDuckDBAdapter(
     name: 'duckdb',
     async query<T = unknown>(sql: string): Promise<{ rows: T[]; rowCount: number }> {
       const result = await conn.query(sql)
-      const rows = result.toArray().map((row) => row.toJSON() as T)
+      const rows = result.toArray().map((row: { toJSON(): unknown }) => row.toJSON() as T)
       return { rows, rowCount: rows.length }
     },
     async close(): Promise<void> {
@@ -954,9 +954,9 @@ async function createSQLiteAdapter(
         return { rows: [], rowCount: 0 }
       }
       const columns = results[0].columns
-      const rows = results[0].values.map((row) => {
+      const rows = results[0].values.map((row: unknown[]) => {
         const obj: Record<string, unknown> = {}
-        columns.forEach((col, idx) => {
+        columns.forEach((col: string, idx: number) => {
           obj[col] = row[idx]
         })
         return obj as T
@@ -1244,7 +1244,7 @@ app.get('/benchmark/analytics/results', async (c) => {
 
   const list = await c.env.RESULTS.list({ prefix, limit })
 
-  const results = list.objects.map((obj) => ({
+  const results = list.objects.map((obj: R2Object) => ({
     key: obj.key,
     size: obj.size,
     uploaded: obj.uploaded.toISOString(),

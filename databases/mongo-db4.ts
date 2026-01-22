@@ -27,6 +27,7 @@ export interface Thing {
   metadata?: Record<string, unknown>
   created_at: Date
   updated_at?: Date
+  [key: string]: unknown // Index signature for Document compatibility
 }
 
 export interface Relationship {
@@ -36,6 +37,7 @@ export interface Relationship {
   object: string
   weight?: number
   created_at: Date
+  [key: string]: unknown // Index signature for Document compatibility
 }
 
 export interface MongDB4Store {
