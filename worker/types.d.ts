@@ -104,8 +104,74 @@ declare module '@dotdo/postgres' {
 declare module '@electric-sql/pglite' {
   export class PGlite {
     waitReady: Promise<void>
-    query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[]; rowCount: number }>
+    query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[]; fields: { name: string }[]; rowCount?: number }>
+    transaction<T>(fn: (tx: PGlite) => Promise<T>): Promise<T>
     close(): Promise<void>
+  }
+}
+
+// libSQL client for SQLite
+declare module '@libsql/client' {
+  export interface Config {
+    url: string
+    authToken?: string
+  }
+  export interface ResultSet {
+    rows: unknown[]
+    columns: string[]
+    rowsAffected: number
+    lastInsertRowid: bigint | null
+  }
+  export interface Client {
+    execute(sql: string, args?: unknown[]): Promise<ResultSet>
+    batch(statements: Array<{ sql: string; args?: unknown[] }>): Promise<ResultSet[]>
+    transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>
+    close(): void
+  }
+  export interface Transaction extends Client {}
+  export function createClient(config: Config): Client
+}
+
+// EvoDB core package
+declare module '@evodb/core' {
+  export interface EvoDBConfig {
+    mode: 'development' | 'production'
+    storage?: unknown
+    schemaEvolution?: 'automatic' | 'locked'
+    inferTypes?: boolean
+    validateOnWrite?: boolean
+    rejectUnknownFields?: boolean
+  }
+  export interface QueryResult<T = Record<string, unknown>> {
+    rows: T[]
+    totalCount: number
+    hasMore: boolean
+  }
+  export interface UpdateResult<T = Record<string, unknown>> {
+    matchedCount: number
+    modifiedCount: number
+    documents?: T[]
+  }
+  export interface DeleteResult<T = Record<string, unknown>> {
+    deletedCount: number
+    documents?: T[]
+  }
+  export class QueryBuilder<T = Record<string, unknown>> {
+    where(column: string, operator: string, value: unknown): QueryBuilder<T>
+    select(columns: string[]): QueryBuilder<T>
+    orderBy(column: string, direction?: 'asc' | 'desc'): QueryBuilder<T>
+    limit(count: number): QueryBuilder<T>
+    offset(count: number): QueryBuilder<T>
+    execute(): Promise<T[]>
+    executeWithMeta(): Promise<QueryResult<T>>
+  }
+  export class EvoDB {
+    constructor(config: EvoDBConfig)
+    insert<T extends Record<string, unknown>>(table: string, data: T | T[]): Promise<T[]>
+    update<T extends Record<string, unknown>>(table: string, filter: Record<string, unknown>, changes: Partial<T>): Promise<UpdateResult<T>>
+    delete<T extends Record<string, unknown>>(table: string, filter: Record<string, unknown>): Promise<DeleteResult<T>>
+    query<T = Record<string, unknown>>(table: string): QueryBuilder<T>
+    getMode(): 'development' | 'production'
   }
 }
 

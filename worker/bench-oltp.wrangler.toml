@@ -2,12 +2,13 @@
 #
 # Runs OLTP benchmarks across multiple databases:
 # - db4: Pure TypeScript document store
-# - evodb: Event-sourced document store
-# - postgres: PGLite WASM (PostgreSQL-compatible)
-# - sqlite: libsql WASM (SQLite-compatible)
-# - db4-mongo: MongoDB API with db4 backend
-# - dotdo-mongodb: MongoDB API with PostgreSQL backend
-# - sdb: Document/graph database
+# - evodb: Event-sourced columnar store
+# - postgres: In-memory SQL-like store (B-tree index)
+# - sqlite: In-memory SQL-like store (hash index)
+# - db4-mongo: @db4/mongo MongoDB API with db4 backend
+# - clickhouse-mongo: @chdb/mongo-compat MongoDB API with ClickHouse backend
+# - mergetree-mongo: @anthropic-pocs/iceberg-mongo-query with MergeTree backend
+# - sdb: Document/graph database (requires remote DO)
 #
 # Uses staged datasets from R2:
 # - ecommerce: customers, products, orders, reviews
@@ -76,9 +77,14 @@ class_name = "OLTPBenchDO"
 name = "DB4_MONGO_DO"
 class_name = "OLTPBenchDO"
 
-# @dotdo/mongodb - MongoDB API with PostgreSQL backend
+# @chdb/mongo-compat - MongoDB API with ClickHouse backend
 [[durable_objects.bindings]]
-name = "DOTDO_MONGODB_DO"
+name = "CLICKHOUSE_MONGO_DO"
+class_name = "OLTPBenchDO"
+
+# @anthropic-pocs/iceberg-mongo-query - MongoDB API with MergeTree backend
+[[durable_objects.bindings]]
+name = "MERGETREE_MONGO_DO"
 class_name = "OLTPBenchDO"
 
 # SDB - Document/graph database

@@ -815,6 +815,152 @@ app.get('/health', (c) => {
   return c.json({ status: 'ok', service: 'bench-container-latency' })
 })
 
+// Warmup endpoint - starts container and waits for ready without running full benchmark
+app.get('/warmup/:database', async (c) => {
+  const database = c.req.param('database') as DatabaseType
+  const size = (c.req.query('size') || 'standard-1') as ContainerSize
+  const maxAttempts = parseInt(c.req.query('maxAttempts') || '60', 10)
+  const delayMs = parseInt(c.req.query('delayMs') || '1000', 10)
+
+  // Validate database
+  const validDatabases: DatabaseType[] = ['postgres', 'sqlite', 'duckdb', 'clickhouse', 'mongo']
+  if (!validDatabases.includes(database)) {
+    return c.json({ error: `Invalid database. Valid options: ${validDatabases.join(', ')}` }, 400)
+  }
+
+  const startTime = performance.now()
+
+  try {
+    const adapter = createContainerAdapter(c.env, database, size)
+
+    // Wait for container to be ready with configurable timeout
+    await waitForContainerReady(adapter, maxAttempts, delayMs)
+
+    const readyTime = performance.now() - startTime
+
+    // Run a simple query to verify the container is fully functional
+    let verifyTime = 0
+    if (database !== 'mongo') {
+      const verifyStart = performance.now()
+      await containerQuery(adapter, 'SELECT 1')
+      verifyTime = performance.now() - verifyStart
+    } else {
+      const verifyStart = performance.now()
+      await mongoFind(adapter, 'benchmark_items', {}, { limit: 1 })
+      verifyTime = performance.now() - verifyStart
+    }
+
+    return c.json({
+      status: 'ready',
+      database,
+      containerSize: size,
+      sessionId: adapter.sessionId,
+      timings: {
+        readyMs: readyTime,
+        verifyMs: verifyTime,
+        totalMs: performance.now() - startTime,
+      },
+      message: `${database} container is warm and ready for benchmarks`,
+    })
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    return c.json({
+      status: 'error',
+      database,
+      containerSize: size,
+      error: errorMessage,
+      timings: {
+        totalMs: performance.now() - startTime,
+      },
+      message: `Failed to warm up ${database} container`,
+    }, 500)
+  }
+})
+
+// Browser-accessible single database benchmark endpoint (GET)
+app.get('/benchmark/container/:database', async (c) => {
+  const database = c.req.param('database') as DatabaseType
+  const size = (c.req.query('size') || 'standard-1') as ContainerSize
+  const iterations = parseInt(c.req.query('iterations') || '10', 10)
+  const operation = (c.req.query('operation') || 'point_lookup') as BenchmarkOperation
+
+  // Validate inputs
+  const validDatabases: DatabaseType[] = ['postgres', 'sqlite', 'duckdb', 'clickhouse', 'mongo']
+  const validSizes: ContainerSize[] = ['lite', 'basic', 'standard-1', 'standard-2', 'standard-4', 'performance-8', 'performance-16']
+  const validOperations: BenchmarkOperation[] = ['point_lookup', 'range_scan', 'insert', 'aggregate']
+
+  if (!validDatabases.includes(database)) {
+    return c.json({ error: `Invalid database. Valid options: ${validDatabases.join(', ')}` }, 400)
+  }
+
+  if (!validSizes.includes(size)) {
+    return c.json({ error: `Invalid size. Valid options: ${validSizes.join(', ')}` }, 400)
+  }
+
+  if (!validOperations.includes(operation)) {
+    return c.json({ error: `Invalid operation. Valid options: ${validOperations.join(', ')}` }, 400)
+  }
+
+  if (iterations < 1 || iterations > 100) {
+    return c.json({ error: 'Iterations must be between 1 and 100 for browser access' }, 400)
+  }
+
+  try {
+    const result = await benchmarkContainer(c.env, database, size, operation, iterations)
+
+    // Also try WASM benchmark for comparison (if available) - catch errors separately
+    let wasmResult = null
+    let wasmError = null
+    try {
+      wasmResult = await benchmarkWasm(database, operation, iterations)
+    } catch (err) {
+      wasmError = err instanceof Error ? err.message : String(err)
+    }
+
+    return c.json({
+      timestamp: new Date().toISOString(),
+      database,
+      containerSize: size,
+      operation,
+      iterations,
+      container: {
+        coldStartMs: result.coldStartMs,
+        avgMs: result.stats.avg,
+        p50Ms: result.stats.p50,
+        p99Ms: result.stats.p99,
+        minMs: result.stats.min,
+        maxMs: result.stats.max,
+      },
+      wasm: wasmResult ? {
+        coldStartMs: wasmResult.coldStartMs,
+        avgMs: wasmResult.stats.avg,
+        p50Ms: wasmResult.stats.p50,
+        p99Ms: wasmResult.stats.p99,
+        minMs: wasmResult.stats.min,
+        maxMs: wasmResult.stats.max,
+      } : null,
+      wasmError: wasmError,
+      comparison: wasmResult ? {
+        coldStartRatio: result.coldStartMs / wasmResult.coldStartMs,
+        avgLatencyRatio: result.stats.avg / wasmResult.stats.avg,
+        message: result.stats.avg < wasmResult.stats.avg
+          ? `Container is ${(wasmResult.stats.avg / result.stats.avg).toFixed(1)}x faster on warm queries`
+          : `WASM is ${(result.stats.avg / wasmResult.stats.avg).toFixed(1)}x faster on warm queries`,
+      } : null,
+    })
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    return c.json({
+      error: errorMessage,
+      database,
+      containerSize: size,
+      operation,
+      iterations,
+      hint: 'Try warming up the container first with GET /warmup/:database',
+    }, 500)
+  }
+})
+
 // Main benchmark endpoint
 app.post('/benchmark/container-latency', async (c) => {
   const database = (c.req.query('database') || 'postgres') as DatabaseType

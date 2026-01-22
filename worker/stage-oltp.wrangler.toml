@@ -22,7 +22,7 @@ account_id = "b6641681fe423910342b9ffa1364c76d"
 
 # Build settings
 [build]
-command = "npx esbuild worker/stage-oltp.ts --bundle --outfile=dist/stage-oltp.js --format=esm --platform=browser"
+command = "npx esbuild worker/stage-oltp.ts --bundle --outfile=dist/stage-oltp.js --format=esm --platform=browser --external:cloudflare:workers"
 
 # Performance settings for data generation worker
 # Data generation can take significant time for larger datasets
@@ -33,6 +33,22 @@ cpu_ms = 300000  # 5 minutes max CPU time (Cloudflare limit)
 [observability]
 enabled = true
 head_sampling_rate = 1  # Full sampling for staging operations
+
+# =============================================================================
+# Durable Objects for Chunked Data Generation
+# =============================================================================
+#
+# The DataGeneratorDO class generates data in chunks to avoid CPU limits.
+# Each DO RPC call gets fresh CPU time, allowing large datasets (100mb+)
+# to be generated across multiple calls.
+
+[[durable_objects.bindings]]
+name = "DATA_GENERATOR"
+class_name = "DataGeneratorDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DataGeneratorDO"]
 
 # =============================================================================
 # R2 Bucket for Generated OLTP Datasets

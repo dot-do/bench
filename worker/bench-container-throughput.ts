@@ -200,11 +200,125 @@ export default {
         })
       }
 
+      // Warmup endpoint - starts container and waits for ready
+      const warmupMatch = path.match(/^\/warmup\/(\w+)$/)
+      if (warmupMatch && request.method === 'GET') {
+        const database = warmupMatch[1] as DatabaseType
+        const maxAttempts = parseInt(url.searchParams.get('maxAttempts') || '60', 10)
+        const delayMs = parseInt(url.searchParams.get('delayMs') || '1000', 10)
+
+        // Validate database
+        const validDatabases: DatabaseType[] = ['postgres', 'clickhouse', 'mongo', 'duckdb', 'sqlite']
+        if (!validDatabases.includes(database)) {
+          return new Response(JSON.stringify({
+            error: `Invalid database. Valid options: ${validDatabases.join(', ')}`,
+          }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+
+        const startTime = performance.now()
+
+        try {
+          const adapter = createDatabaseAdapter(database, env)
+
+          // Wait for container to be ready with configurable timeout
+          await containerConnectWithTimeout(adapter, maxAttempts, delayMs)
+
+          const readyTime = performance.now() - startTime
+
+          // Run a simple query to verify the container is fully functional
+          const verifyStart = performance.now()
+          await containerPing(adapter)
+          const verifyTime = performance.now() - verifyStart
+
+          return new Response(JSON.stringify({
+            status: 'ready',
+            database,
+            sessionId: adapter.sessionId,
+            timings: {
+              readyMs: readyTime,
+              verifyMs: verifyTime,
+              totalMs: performance.now() - startTime,
+            },
+            message: `${database} container is warm and ready for benchmarks`,
+          }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error)
+          return new Response(JSON.stringify({
+            status: 'error',
+            database,
+            error: errorMessage,
+            timings: {
+              totalMs: performance.now() - startTime,
+            },
+            message: `Failed to warm up ${database} container`,
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+      }
+
+      // Browser-accessible single database benchmark endpoint (GET)
+      const benchmarkMatch = path.match(/^\/benchmark\/container\/(\w+)$/)
+      if (benchmarkMatch && request.method === 'GET') {
+        const database = benchmarkMatch[1] as DatabaseType
+        const duration = parseInt(url.searchParams.get('duration') || '5', 10)
+        const concurrency = parseInt(url.searchParams.get('concurrency') || '10', 10)
+        const containerSize = (url.searchParams.get('size') || 'standard-1') as ContainerSize
+
+        // Validate database
+        const validDatabases: DatabaseType[] = ['postgres', 'clickhouse', 'mongo', 'duckdb', 'sqlite']
+        if (!validDatabases.includes(database)) {
+          return new Response(JSON.stringify({
+            error: `Invalid database. Valid options: ${validDatabases.join(', ')}`,
+          }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+
+        // Limit duration for browser access
+        const safeDuration = Math.min(duration, 30)
+        const safeConcurrency = Math.min(concurrency, 50)
+
+        try {
+          const result = await runThroughputBenchmark({
+            database,
+            concurrency: safeConcurrency,
+            duration: safeDuration,
+            containerSize,
+          }, env, ctx)
+
+          return new Response(JSON.stringify(result, null, 2), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error)
+          return new Response(JSON.stringify({
+            error: errorMessage,
+            database,
+            duration: safeDuration,
+            concurrency: safeConcurrency,
+            hint: 'Try warming up the container first with GET /warmup/:database',
+          }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          })
+        }
+      }
+
       return new Response(JSON.stringify({
         error: 'Not found',
         availableEndpoints: [
           'POST /benchmark/container-throughput?database=postgres&concurrency=50&duration=60',
           'GET /benchmark/container-throughput/quick?database=postgres',
+          'GET /warmup/:database - Warm up container (postgres, clickhouse, mongo, duckdb, sqlite)',
+          'GET /benchmark/container/:database - Quick benchmark for browser',
           'GET /health',
         ],
       }), {
@@ -322,9 +436,14 @@ function createDatabaseAdapter(database: DatabaseType, env: Env): ContainerAdapt
 // =============================================================================
 
 async function containerConnect(adapter: ContainerAdapter): Promise<void> {
-  const maxAttempts = 30
-  const delayMs = 1000
+  return containerConnectWithTimeout(adapter, 30, 1000)
+}
 
+async function containerConnectWithTimeout(
+  adapter: ContainerAdapter,
+  maxAttempts: number = 30,
+  delayMs: number = 1000
+): Promise<void> {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const healthPath = adapter.database === 'clickhouse' ? '/ping' : '/ready'
@@ -343,7 +462,7 @@ async function containerConnect(adapter: ContainerAdapter): Promise<void> {
     await sleep(delayMs)
   }
 
-  throw new Error(`${adapter.database} container failed to become ready`)
+  throw new Error(`${adapter.database} container failed to become ready after ${maxAttempts} attempts`)
 }
 
 async function containerPing(adapter: ContainerAdapter): Promise<void> {

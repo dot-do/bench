@@ -34,7 +34,7 @@
     "gzip-size": "^7.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0",
-    "wrangler": "^3.100.0"
+    "wrangler": "^4.59.3"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.1.0",
@@ -44,7 +44,10 @@
     "@dotdo/graphdb": "file:packages/graphdb",
     "@dotdo/poc-tigerbeetle-do": "file:packages/pocs/packages/tigerbeetle-do",
     "@dotdo/sdb": "file:packages/sdb",
+    "@electric-sql/pglite": "^0.2.0",
+    "@evodb/core": "file:packages/evodb/core",
     "@faker-js/faker": "^10.2.0",
+    "@libsql/client": "^0.14.0",
     "evodb": "^0.1.0",
     "hono": "^4.7.0"
   },
