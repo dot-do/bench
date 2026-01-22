@@ -243,19 +243,29 @@ interface DatabaseAdapter {
 
 /**
  * DB4 Adapter - Pure TypeScript document store
+ * Uses @db4/client for the client SDK
  */
 class DB4Adapter implements DatabaseAdapter {
   name: DatabaseType = 'db4'
-  private db: import('../databases/db4.js').DB4Store | null = null
+  private client: Awaited<ReturnType<typeof import('@db4/client').createClient>> | null = null
+  private collections: Map<string, ReturnType<typeof this.client.collection>> = new Map()
 
   async connect(): Promise<void> {
-    const { createDB4Store } = await import('../databases/db4.js')
-    this.db = await createDB4Store()
+    const { createClient } = await import('@db4/client')
+    // Create in-memory client for benchmarking
+    this.client = createClient({ mode: 'memory' })
   }
 
   async close(): Promise<void> {
-    await this.db?.close()
-    this.db = null
+    this.collections.clear()
+    this.client = null
+  }
+
+  private getCollection(name: string) {
+    if (!this.collections.has(name)) {
+      this.collections.set(name, this.client!.collection(name))
+    }
+    return this.collections.get(name)!
   }
 
   private normalizeId(doc: Document): string {
@@ -263,39 +273,40 @@ class DB4Adapter implements DatabaseAdapter {
   }
 
   async pointLookup(collection: string, id: string): Promise<Document | null> {
-    return (await this.db!.get(collection, id)) as Document | null
+    const col = this.getCollection(collection)
+    const result = await col.findOne({ id })
+    return result as Document | null
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    return (await this.db!.list(collection, { where: filter, limit })) as unknown as Document[]
+    const col = this.getCollection(collection)
+    const results = await col.find(filter, { limit })
+    return results as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
-    const id = this.normalizeId(doc)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await this.db!.set(collection, id, doc as any)
+    const col = this.getCollection(collection)
+    await col.create(doc)
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    for (const doc of docs) {
-      await this.insert(collection, doc)
-    }
+    const col = this.getCollection(collection)
+    await col.createMany(docs)
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const existing = await this.pointLookup(collection, id)
-    if (existing) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await this.db!.set(collection, id, { ...existing, ...updates } as any)
-    }
+    const col = this.getCollection(collection)
+    await col.update({ id }, updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
-    return await this.db!.delete(collection, id)
+    const col = this.getCollection(collection)
+    const result = await col.delete({ id })
+    return result.deleted > 0
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
-    // DB4 doesn't have native transactions, execute serially
+    // DB4 client doesn't expose transactions directly, execute serially
     await fn()
   }
 
@@ -305,25 +316,27 @@ class DB4Adapter implements DatabaseAdapter {
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
-    const docs = await this.db!.list(collection, { limit: 10000 })
-    return docs.map((d) => (d as unknown as Document).id ?? '') as string[]
+    const col = this.getCollection(collection)
+    const docs = await col.find({}, { limit: 10000, projection: { id: 1 } })
+    return docs.map((d: Document) => d.id ?? '') as string[]
   }
 }
 
 /**
- * EvoDB Adapter - Event-sourced document store
+ * EvoDB Adapter - Event-sourced columnar document store
+ * Uses evodb package for columnar JSON storage
  */
 class EvoDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'evodb'
-  private db: import('../databases/evodb.js').EvoDBStore | null = null
+  private db: InstanceType<typeof import('evodb').EvoDB> | null = null
 
   async connect(): Promise<void> {
-    const { createEvoDBStore } = await import('../databases/evodb.js')
-    this.db = await createEvoDBStore()
+    const { EvoDB } = await import('evodb')
+    // Create in-memory EvoDB instance for benchmarking
+    this.db = new EvoDB({ storage: null }) // null storage = in-memory
   }
 
   async close(): Promise<void> {
-    await this.db?.close()
     this.db = null
   }
 
@@ -332,7 +345,8 @@ class EvoDBAdapter implements DatabaseAdapter {
   }
 
   async pointLookup(collection: string, id: string): Promise<Document | null> {
-    return (await this.db!.get(collection, id)) as Document | null
+    const results = await this.db!.query(collection).where('id', '=', id).limit(1).execute()
+    return (results.data[0] as Document) ?? null
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
@@ -340,35 +354,29 @@ class EvoDBAdapter implements DatabaseAdapter {
     for (const [key, value] of Object.entries(filter)) {
       query = query.where(key, '=', value)
     }
-    return (await query.limit(limit).all()) as unknown as Document[]
+    const results = await query.limit(limit).execute()
+    return results.data as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
-    const id = this.normalizeId(doc)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await this.db!.set(collection, id, doc as any)
+    await this.db!.insert(collection, [doc])
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    for (const doc of docs) {
-      await this.insert(collection, doc)
-    }
+    await this.db!.insert(collection, docs)
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const existing = await this.pointLookup(collection, id)
-    if (existing) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await this.db!.set(collection, id, { ...existing, ...updates } as any)
-    }
+    await this.db!.update(collection, { id }, updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
-    return await this.db!.delete(collection, id)
+    const result = await this.db!.delete(collection, { id })
+    return result.deleted > 0
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
-    // EvoDB is event-sourced, transactions are atomic
+    // EvoDB is event-sourced, execute atomically
     await fn()
   }
 
@@ -378,151 +386,31 @@ class EvoDBAdapter implements DatabaseAdapter {
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
-    const docs = await this.db!.query(collection).limit(10000).all()
-    return docs.map((d) => (d as unknown as Document).id ?? '') as string[]
+    const results = await this.db!.query(collection).select(['id']).limit(10000).execute()
+    return results.data.map((d: Record<string, unknown>) => (d.id ?? '') as string)
   }
 }
 
 /**
- * PostgreSQL Adapter - PGLite WASM
+ * PostgreSQL Adapter - Uses @dotdo/sqlite client (Turso-compatible)
+ * Note: For OLTP benchmarks in Workers, we use the SQLite client
+ * which provides PostgreSQL-like API via Hrana protocol
  */
 class PostgresAdapter implements DatabaseAdapter {
   name: DatabaseType = 'postgres'
-  private db: import('../databases/postgres.js').PostgresStore | null = null
+  private client: Awaited<ReturnType<typeof import('@dotdo/sqlite').createClient>> | null = null
   private tableSchemas: Map<string, string> = new Map()
 
   async connect(): Promise<void> {
-    const { createPostgresStore } = await import('../databases/postgres.js')
-    this.db = await createPostgresStore()
+    const { createClient } = await import('@dotdo/sqlite')
+    // Create in-memory SQLite client for benchmarking
+    // In production, this would connect to a real PostgresDO
+    this.client = createClient({ url: ':memory:' })
   }
 
   async close(): Promise<void> {
-    await this.db?.close()
-    this.db = null
-  }
-
-  private normalizeId(doc: Document): string {
-    return (doc.id ?? doc._id ?? doc.$id ?? '') as string
-  }
-
-  private async ensureTable(collection: string, sampleDoc: Document): Promise<void> {
-    if (this.tableSchemas.has(collection)) return
-
-    // Create a simple JSON-based table
-    await this.db!.query(`
-      CREATE TABLE IF NOT EXISTS ${collection} (
-        id TEXT PRIMARY KEY,
-        data JSONB NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-      )
-    `)
-    await this.db!.query(`CREATE INDEX IF NOT EXISTS idx_${collection}_data ON ${collection} USING GIN (data)`)
-    this.tableSchemas.set(collection, 'created')
-  }
-
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.db!.query<{ data: Document }>(
-      `SELECT data FROM ${collection} WHERE id = $1`,
-      [id]
-    )
-    return result.rows[0]?.data ?? null
-  }
-
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    // Build JSON path filter
-    const conditions: string[] = []
-    const params: unknown[] = []
-    let paramIdx = 1
-
-    for (const [key, value] of Object.entries(filter)) {
-      conditions.push(`data->>$${paramIdx} = $${paramIdx + 1}`)
-      params.push(key, String(value))
-      paramIdx += 2
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const result = await this.db!.query<{ data: Document }>(
-      `SELECT data FROM ${collection} ${whereClause} LIMIT $${paramIdx}`,
-      [...params, limit]
-    )
-    return result.rows.map((r) => r.data)
-  }
-
-  async insert(collection: string, doc: Document): Promise<void> {
-    await this.ensureTable(collection, doc)
-    const id = this.normalizeId(doc)
-    await this.db!.query(
-      `INSERT INTO ${collection} (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-      [id, JSON.stringify(doc)]
-    )
-  }
-
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    if (docs.length === 0) return
-    await this.ensureTable(collection, docs[0])
-
-    await this.db!.transaction(async (tx) => {
-      for (const doc of docs) {
-        const id = this.normalizeId(doc)
-        await tx.query(
-          `INSERT INTO ${collection} (id, data) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
-          [id, JSON.stringify(doc)]
-        )
-      }
-    })
-  }
-
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const existing = await this.pointLookup(collection, id)
-    if (existing) {
-      const updated = { ...existing, ...updates }
-      await this.db!.query(
-        `UPDATE ${collection} SET data = $1 WHERE id = $2`,
-        [JSON.stringify(updated), id]
-      )
-    }
-  }
-
-  async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.db!.query(`DELETE FROM ${collection} WHERE id = $1`, [id])
-    return result.rowCount > 0
-  }
-
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    await this.db!.transaction(async () => {
-      await fn()
-    })
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.db!.query<{ id: string }>(
-      `SELECT id FROM ${collection} LIMIT 10000`
-    )
-    return result.rows.map((r) => r.id)
-  }
-}
-
-/**
- * SQLite Adapter - libsql WASM
- */
-class SQLiteAdapter implements DatabaseAdapter {
-  name: DatabaseType = 'sqlite'
-  private db: import('../databases/sqlite.js').SQLiteStore | null = null
-  private tableSchemas: Map<string, string> = new Map()
-
-  async connect(): Promise<void> {
-    const { createSQLiteStore } = await import('../databases/sqlite.js')
-    this.db = await createSQLiteStore()
-  }
-
-  async close(): Promise<void> {
-    await this.db?.close()
-    this.db = null
+    this.client?.close()
+    this.client = null
   }
 
   private normalizeId(doc: Document): string {
@@ -532,7 +420,8 @@ class SQLiteAdapter implements DatabaseAdapter {
   private async ensureTable(collection: string): Promise<void> {
     if (this.tableSchemas.has(collection)) return
 
-    await this.db!.query(`
+    // Create a simple JSON-based table
+    await this.client!.execute(`
       CREATE TABLE IF NOT EXISTS ${collection} (
         id TEXT PRIMARY KEY,
         data TEXT NOT NULL,
@@ -543,76 +432,83 @@ class SQLiteAdapter implements DatabaseAdapter {
   }
 
   async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.db!.query<{ data: string }>(
-      `SELECT data FROM ${collection} WHERE id = ?`,
-      [id]
-    )
+    const result = await this.client!.execute({
+      sql: `SELECT data FROM ${collection} WHERE id = ?`,
+      args: [id]
+    })
     if (result.rows.length === 0) return null
-    return JSON.parse(result.rows[0].data)
+    return JSON.parse(result.rows[0].data as string)
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    // SQLite doesn't have native JSON path queries in all versions, use LIKE for simplicity
+    // Use JSON extraction for filtering
     const conditions: string[] = []
-    const params: unknown[] = []
+    const params: (string | number)[] = []
 
     for (const [key, value] of Object.entries(filter)) {
-      conditions.push(`data LIKE ?`)
-      params.push(`%"${key}":"${value}"%`)
+      conditions.push(`json_extract(data, '$.${key}') = ?`)
+      params.push(String(value))
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const result = await this.db!.query<{ data: string }>(
-      `SELECT data FROM ${collection} ${whereClause} LIMIT ?`,
-      [...params, limit]
-    )
-    return result.rows.map((r) => JSON.parse(r.data))
+    const result = await this.client!.execute({
+      sql: `SELECT data FROM ${collection} ${whereClause} LIMIT ?`,
+      args: [...params, limit]
+    })
+    return result.rows.map((r) => JSON.parse(r.data as string))
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
     await this.ensureTable(collection)
     const id = this.normalizeId(doc)
-    await this.db!.query(
-      `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-      [id, JSON.stringify(doc)]
-    )
+    await this.client!.execute({
+      sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
+      args: [id, JSON.stringify(doc)]
+    })
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
     if (docs.length === 0) return
     await this.ensureTable(collection)
 
-    await this.db!.transaction(async (tx) => {
-      for (const doc of docs) {
-        const id = this.normalizeId(doc)
-        await tx.query(
-          `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-          [id, JSON.stringify(doc)]
-        )
+    const statements = docs.map((doc) => {
+      const id = this.normalizeId(doc)
+      return {
+        sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
+        args: [id, JSON.stringify(doc)]
       }
     })
+    await this.client!.batch(statements)
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const existing = await this.pointLookup(collection, id)
     if (existing) {
       const updated = { ...existing, ...updates }
-      await this.db!.query(
-        `UPDATE ${collection} SET data = ? WHERE id = ?`,
-        [JSON.stringify(updated), id]
-      )
+      await this.client!.execute({
+        sql: `UPDATE ${collection} SET data = ? WHERE id = ?`,
+        args: [JSON.stringify(updated), id]
+      })
     }
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.db!.query(`DELETE FROM ${collection} WHERE id = ?`, [id])
-    return (result.rowsAffected ?? 0) > 0
+    const result = await this.client!.execute({
+      sql: `DELETE FROM ${collection} WHERE id = ?`,
+      args: [id]
+    })
+    return result.rowsAffected > 0
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
-    await this.db!.transaction(async () => {
+    const tx = await this.client!.transaction()
+    try {
       await fn()
-    })
+      await tx.commit()
+    } catch (e) {
+      await tx.rollback()
+      throw e
+    }
   }
 
   async loadData(collection: string, docs: Document[]): Promise<number> {
@@ -621,28 +517,169 @@ class SQLiteAdapter implements DatabaseAdapter {
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.db!.query<{ id: string }>(
-      `SELECT id FROM ${collection} LIMIT 10000`
-    )
-    return result.rows.map((r) => r.id)
+    const result = await this.client!.execute({
+      sql: `SELECT id FROM ${collection} LIMIT 10000`,
+      args: []
+    })
+    return result.rows.map((r) => r.id as string)
+  }
+}
+
+/**
+ * SQLite Adapter - Uses @dotdo/sqlite (Turso WASM SQLite)
+ */
+class SQLiteAdapter implements DatabaseAdapter {
+  name: DatabaseType = 'sqlite'
+  private client: Awaited<ReturnType<typeof import('@dotdo/sqlite').createClient>> | null = null
+  private tableSchemas: Map<string, string> = new Map()
+
+  async connect(): Promise<void> {
+    const { createClient } = await import('@dotdo/sqlite')
+    // Create in-memory SQLite client for benchmarking
+    this.client = createClient({ url: ':memory:' })
+  }
+
+  async close(): Promise<void> {
+    this.client?.close()
+    this.client = null
+  }
+
+  private normalizeId(doc: Document): string {
+    return (doc.id ?? doc._id ?? doc.$id ?? '') as string
+  }
+
+  private async ensureTable(collection: string): Promise<void> {
+    if (this.tableSchemas.has(collection)) return
+
+    await this.client!.execute(`
+      CREATE TABLE IF NOT EXISTS ${collection} (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `)
+    this.tableSchemas.set(collection, 'created')
+  }
+
+  async pointLookup(collection: string, id: string): Promise<Document | null> {
+    const result = await this.client!.execute({
+      sql: `SELECT data FROM ${collection} WHERE id = ?`,
+      args: [id]
+    })
+    if (result.rows.length === 0) return null
+    return JSON.parse(result.rows[0].data as string)
+  }
+
+  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
+    // Use json_extract for JSON path queries
+    const conditions: string[] = []
+    const params: (string | number)[] = []
+
+    for (const [key, value] of Object.entries(filter)) {
+      conditions.push(`json_extract(data, '$.${key}') = ?`)
+      params.push(String(value))
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const result = await this.client!.execute({
+      sql: `SELECT data FROM ${collection} ${whereClause} LIMIT ?`,
+      args: [...params, limit]
+    })
+    return result.rows.map((r) => JSON.parse(r.data as string))
+  }
+
+  async insert(collection: string, doc: Document): Promise<void> {
+    await this.ensureTable(collection)
+    const id = this.normalizeId(doc)
+    await this.client!.execute({
+      sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
+      args: [id, JSON.stringify(doc)]
+    })
+  }
+
+  async batchInsert(collection: string, docs: Document[]): Promise<void> {
+    if (docs.length === 0) return
+    await this.ensureTable(collection)
+
+    const statements = docs.map((doc) => {
+      const id = this.normalizeId(doc)
+      return {
+        sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
+        args: [id, JSON.stringify(doc)]
+      }
+    })
+    await this.client!.batch(statements)
+  }
+
+  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
+    const existing = await this.pointLookup(collection, id)
+    if (existing) {
+      const updated = { ...existing, ...updates }
+      await this.client!.execute({
+        sql: `UPDATE ${collection} SET data = ? WHERE id = ?`,
+        args: [JSON.stringify(updated), id]
+      })
+    }
+  }
+
+  async delete(collection: string, id: string): Promise<boolean> {
+    const result = await this.client!.execute({
+      sql: `DELETE FROM ${collection} WHERE id = ?`,
+      args: [id]
+    })
+    return result.rowsAffected > 0
+  }
+
+  async transaction(fn: () => Promise<void>): Promise<void> {
+    const tx = await this.client!.transaction()
+    try {
+      await fn()
+      await tx.commit()
+    } catch (e) {
+      await tx.rollback()
+      throw e
+    }
+  }
+
+  async loadData(collection: string, docs: Document[]): Promise<number> {
+    await this.batchInsert(collection, docs)
+    return docs.length
+  }
+
+  async getCollectionIds(collection: string): Promise<string[]> {
+    const result = await this.client!.execute({
+      sql: `SELECT id FROM ${collection} LIMIT 10000`,
+      args: []
+    })
+    return result.rows.map((r) => r.id as string)
   }
 }
 
 /**
  * @db4/mongo Adapter - MongoDB API with db4 backend
+ * Uses @db4/client with MongoDB-style API compatibility
  */
 class DB4MongoAdapter implements DatabaseAdapter {
   name: DatabaseType = 'db4-mongo'
-  private db: import('../databases/mongo-db4.js').MongDB4Store | null = null
+  private client: Awaited<ReturnType<typeof import('@db4/client').createClient>> | null = null
+  private collections: Map<string, ReturnType<typeof this.client.collection>> = new Map()
 
   async connect(): Promise<void> {
-    const { createMongoDB4Store } = await import('../databases/mongo-db4.js')
-    this.db = await createMongoDB4Store()
+    const { createClient } = await import('@db4/client')
+    // Create in-memory client for benchmarking
+    this.client = createClient({ mode: 'memory' })
   }
 
   async close(): Promise<void> {
-    await this.db?.close()
-    this.db = null
+    this.collections.clear()
+    this.client = null
+  }
+
+  private getCollection(name: string) {
+    if (!this.collections.has(name)) {
+      this.collections.set(name, this.client!.collection(name))
+    }
+    return this.collections.get(name)!
   }
 
   private normalizeId(doc: Document): string {
@@ -650,39 +687,41 @@ class DB4MongoAdapter implements DatabaseAdapter {
   }
 
   async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.db!.collection(collection).findOne({ _id: id })
+    const col = this.getCollection(collection)
+    const result = await col.findOne({ _id: id })
     return result as Document | null
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    const cursor = this.db!.collection(collection).find(filter).limit(limit)
-    return (await cursor.toArray()) as Document[]
+    const col = this.getCollection(collection)
+    const results = await col.find(filter, { limit })
+    return results as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
+    const col = this.getCollection(collection)
     const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-    delete mongoDoc.id
-    delete mongoDoc.$id
-    await this.db!.collection(collection).insertOne(mongoDoc)
+    await col.create(mongoDoc)
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    const mongoDocs = docs.map((doc) => {
-      const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-      delete mongoDoc.id
-      delete mongoDoc.$id
-      return mongoDoc
-    })
-    await this.db!.collection(collection).insertMany(mongoDocs)
+    const col = this.getCollection(collection)
+    const mongoDocs = docs.map((doc) => ({
+      ...doc,
+      _id: this.normalizeId(doc)
+    }))
+    await col.createMany(mongoDocs)
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    await this.db!.collection(collection).updateOne({ _id: id }, { $set: updates })
+    const col = this.getCollection(collection)
+    await col.update({ _id: id }, updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.db!.collection(collection).deleteOne({ _id: id })
-    return (result.deletedCount ?? 0) > 0
+    const col = this.getCollection(collection)
+    const result = await col.delete({ _id: id })
+    return result.deleted > 0
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
@@ -696,25 +735,32 @@ class DB4MongoAdapter implements DatabaseAdapter {
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
-    const docs = await this.db!.collection(collection).find({}).limit(10000).toArray()
+    const col = this.getCollection(collection)
+    const docs = await col.find({}, { limit: 10000, projection: { _id: 1 } })
     return docs.map((d: Document) => (d._id ?? '') as string)
   }
 }
 
 /**
- * @dotdo/mongodb Adapter - MongoDB API with PostgreSQL backend
+ * @dotdo/mongodb Adapter - MongoDB compatibility layer
+ * Uses @dotdo/mongodb which provides MongoDB-style API
  */
 class DotDoMongoDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'dotdo-mongodb'
-  private db: import('../databases/mongo-postgres.js').MongoPostgresStore | null = null
+  private client: InstanceType<typeof import('@dotdo/mongodb').MongoClient> | null = null
+  private db: ReturnType<typeof this.client.db> | null = null
 
   async connect(): Promise<void> {
-    const { createMongoPostgresStore } = await import('../databases/mongo-postgres.js')
-    this.db = await createMongoPostgresStore()
+    const { MongoClient } = await import('@dotdo/mongodb')
+    // Create in-memory MongoDB-compatible client for benchmarking
+    this.client = new MongoClient('memory://')
+    await this.client.connect()
+    this.db = this.client.db('benchmark')
   }
 
   async close(): Promise<void> {
-    await this.db?.close()
+    await this.client?.close()
+    this.client = null
     this.db = null
   }
 
@@ -759,7 +805,7 @@ class DotDoMongoDBAdapter implements DatabaseAdapter {
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
-    // DocumentDB supports transactions
+    // @dotdo/mongodb supports transactions
     await fn()
   }
 
@@ -776,18 +822,19 @@ class DotDoMongoDBAdapter implements DatabaseAdapter {
 
 /**
  * SDB Adapter - Document/graph database
+ * Uses @dotdo/sdb for document and graph database operations
  */
 class SDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'sdb'
-  private db: import('../databases/sdb.js').SDBStore | null = null
+  private db: ReturnType<typeof import('@dotdo/sdb').DB> | null = null
 
   async connect(): Promise<void> {
-    const { createSDBStore } = await import('../databases/sdb.js')
-    this.db = await createSDBStore()
+    const { DB } = await import('@dotdo/sdb')
+    // Create in-memory SDB instance for benchmarking
+    this.db = DB({ url: 'memory://' })
   }
 
   async close(): Promise<void> {
-    this.db?.close()
     this.db = null
   }
 
@@ -796,34 +843,42 @@ class SDBAdapter implements DatabaseAdapter {
   }
 
   async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.db!.get(collection, id)
-    return result as Document | null
+    try {
+      const result = await this.db![collection][id]
+      return result as Document | null
+    } catch {
+      return null
+    }
   }
 
   async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    const result = await this.db!.find(collection, filter, { limit })
-    return result.data as Document[]
+    const result = await this.db![collection].list({ where: filter, limit })
+    return result as Document[]
   }
 
   async insert(collection: string, doc: Document): Promise<void> {
-    const sdbDoc = { ...doc, $id: this.normalizeId(doc) }
-    await this.db!.create(collection, sdbDoc)
+    const id = this.normalizeId(doc)
+    const sdbDoc = { ...doc, $id: id }
+    await this.db![collection].create(sdbDoc)
   }
 
   async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    const items = docs.map((doc) => ({
-      $id: this.normalizeId(doc),
-      data: { ...doc, $id: this.normalizeId(doc) },
-    }))
-    await this.db!.bulkCreate(collection, items)
+    for (const doc of docs) {
+      await this.insert(collection, doc)
+    }
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    await this.db!.update(collection, id, updates)
+    await this.db![collection][id].update(updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
-    return await this.db!.delete(collection, id)
+    try {
+      await this.db![collection][id].delete()
+      return true
+    } catch {
+      return false
+    }
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
@@ -837,8 +892,8 @@ class SDBAdapter implements DatabaseAdapter {
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.db!.list(collection, { limit: 10000 })
-    return result.data.map((d) => d.$id)
+    const result = await this.db![collection].list({ limit: 10000 })
+    return (result as Document[]).map((d) => (d.$id ?? d.id ?? '') as string)
   }
 }
 

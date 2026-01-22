@@ -37,19 +37,27 @@
     "wrangler": "^3.100.0"
   },
   "dependencies": {
-    "@dotdo/poc-tigerbeetle-do": "file:../pocs/packages/tigerbeetle-do",
+    "@db4/client": "^0.1.0",
+    "@db4/core": "^0.1.0",
+    "@db4/do": "^0.1.0",
+    "@dotdo/graphdb": "file:packages/graphdb",
+    "@dotdo/sdb": "file:packages/sdb",
+    "@dotdo/poc-tigerbeetle-do": "file:packages/pocs/packages/tigerbeetle-do",
+    "evodb": "^0.1.0",
     "hono": "^4.7.0"
   },
-  "optionalPeerDependencies": {
-    "@dotdo/db4": "Optional database backend",
-    "@dotdo/evodb": "Optional database backend",
-    "@dotdo/postgres": "Optional database backend",
-    "@dotdo/sqlite": "Optional database backend",
-    "@dotdo/duckdb": "Optional database backend",
-    "@db4/mongo": "MongoDB API on db4 backend (pure TypeScript, zero WASM)",
-    "@dotdo/mongodb": "MongoDB API on PostgreSQL/DocumentDB backend (PGLite WASM)",
-    "tigerbeetle-node": "TigerBeetle native client for financial benchmarks (requires TigerBeetle cluster)",
-    "@dotdo/graphdb": "Graph database with triple store, WebSocket hibernation, and R2 lakehouse",
-    "@dotdo/sdb": "Document/graph database with schema-based documents and WebSocket subscriptions"
+  "pnpm": {
+    "overrides": {
+      "@db4/core": "^0.1.0",
+      "@db4/config": "^0.1.0",
+      "@db4/rpc": "^0.1.0",
+      "@db4/storage": "^0.1.0",
+      "@db4/schema": "^0.1.0",
+      "@db4/query": "^0.1.0",
+      "@db4/vortex": "^0.1.0",
+      "@db4/cache": "^0.1.0",
+      "@db4/auth": "^0.1.0",
+      "@db4/replication": "^0.1.0"
+    }
   }
 }

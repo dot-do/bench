@@ -31,6 +31,38 @@ bucket_name = "bench-results"
 preview_bucket_name = "bench-results-preview"
 
 # ==============================================================================
+# Durable Object Bindings
+# ==============================================================================
+# Durable Objects manage container lifecycle and provide simulated mode
+# when real Cloudflare Containers are not available.
+# ==============================================================================
+
+[[durable_objects.bindings]]
+name = "POSTGRES_DO"
+class_name = "PostgresContainerDO"
+
+[[durable_objects.bindings]]
+name = "CLICKHOUSE_DO"
+class_name = "ClickHouseContainerDO"
+
+[[durable_objects.bindings]]
+name = "MONGO_DO"
+class_name = "MongoContainerDO"
+
+[[durable_objects.bindings]]
+name = "DUCKDB_DO"
+class_name = "DuckDBContainerDO"
+
+[[durable_objects.bindings]]
+name = "SQLITE_DO"
+class_name = "SQLiteContainerDO"
+
+# Durable Object migrations
+[[migrations]]
+tag = "v1"
+new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO", "DuckDBContainerDO", "SQLiteContainerDO"]
+
+# ==============================================================================
 # Container Bindings
 # ==============================================================================
 # Each container runs a database with an HTTP bridge for communication.
@@ -44,40 +76,44 @@ preview_bucket_name = "bench-results-preview"
 # - standard-4:     4GB RAM, 4 vCPU ($0.24/hr)
 # - performance-8:  8GB RAM, 8 vCPU ($0.48/hr)
 # - performance-16: 16GB RAM, 16 vCPU ($0.96/hr)
+#
+# NOTE: Container bindings below are placeholders. When Cloudflare Containers
+# become available, uncomment these sections. Until then, use the Durable Object
+# based simulated mode for benchmarking.
 # ==============================================================================
 
 # PostgreSQL Container
 # Runs PostgreSQL with an HTTP REST API bridge
 [[containers]]
-class_name = "PostgresContainer"
+class_name = "PostgresContainerDO"
 image = "../containers/dockerfiles/Dockerfile.postgres"
 max_instances = 10
 
 # ClickHouse Container
 # ClickHouse has native HTTP interface on port 8123
 [[containers]]
-class_name = "ClickHouseContainer"
+class_name = "ClickHouseContainerDO"
 image = "../containers/dockerfiles/Dockerfile.clickhouse"
 max_instances = 10
 
 # MongoDB Container
 # Runs MongoDB with an HTTP REST API bridge
 [[containers]]
-class_name = "MongoContainer"
+class_name = "MongoContainerDO"
 image = "../containers/dockerfiles/Dockerfile.mongo"
 max_instances = 10
 
 # DuckDB Container
 # DuckDB with HTTP REST API for analytical queries
 [[containers]]
-class_name = "DuckDBContainer"
+class_name = "DuckDBContainerDO"
 image = "../containers/dockerfiles/Dockerfile.duckdb"
 max_instances = 10
 
 # SQLite Container
 # SQLite with HTTP REST API bridge
 [[containers]]
-class_name = "SQLiteContainer"
+class_name = "SQLiteContainerDO"
 image = "../containers/dockerfiles/Dockerfile.sqlite"
 max_instances = 10
 

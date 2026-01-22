@@ -1,0 +1,21 @@
+[submodule "packages/db4"]
+	path = packages/db4
+	url = https://github.com/dot-do/db4.git
+[submodule "packages/evodb"]
+	path = packages/evodb
+	url = https://github.com/dot-do/evodb.git
+[submodule "packages/postgres"]
+	path = packages/postgres
+	url = https://github.com/dot-do/postgres.git
+[submodule "packages/sqlite"]
+	path = packages/sqlite
+	url = https://github.com/dot-do/sqlite.git
+[submodule "packages/graphdb"]
+	path = packages/graphdb
+	url = https://github.com/dot-do/graphdb.git
+[submodule "packages/sdb"]
+	path = packages/sdb
+	url = https://github.com/dot-do/sdb.git
+[submodule "packages/pocs"]
+	path = packages/pocs
+	url = https://github.com/dot-do/pocs.git

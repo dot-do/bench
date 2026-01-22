@@ -28,6 +28,24 @@ import {
   createSQLiteContainer,
 } from '../containers/index.js'
 
+// Container Durable Objects
+import {
+  PostgresContainerDO,
+  ClickHouseContainerDO,
+  MongoContainerDO,
+  DuckDBContainerDO,
+  SQLiteContainerDO,
+} from './adapters/container-do.js'
+
+// Re-export DO classes for wrangler
+export {
+  PostgresContainerDO,
+  ClickHouseContainerDO,
+  MongoContainerDO,
+  DuckDBContainerDO,
+  SQLiteContainerDO,
+}
+
 // WASM database types
 import type { PostgresStore } from '../databases/postgres.js'
 import type { SQLiteStore } from '../databases/sqlite.js'
@@ -35,12 +53,19 @@ import type { DuckDBStore } from '../databases/duckdb.js'
 
 // Environment bindings
 interface Env {
-  // Container bindings
+  // Container bindings (direct container access)
   POSTGRES_CONTAINER: Container
   CLICKHOUSE_CONTAINER: Container
   MONGO_CONTAINER: Container
   DUCKDB_CONTAINER: Container
   SQLITE_CONTAINER: Container
+
+  // Durable Object namespaces for container management
+  POSTGRES_DO: DurableObjectNamespace
+  CLICKHOUSE_DO: DurableObjectNamespace
+  MONGO_DO: DurableObjectNamespace
+  DUCKDB_DO: DurableObjectNamespace
+  SQLITE_DO: DurableObjectNamespace
 
   // R2 bucket for storing results
   BENCHMARK_RESULTS: R2Bucket

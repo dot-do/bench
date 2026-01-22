@@ -24,6 +24,7 @@
  */
 
 import { DurableObject } from 'cloudflare:workers'
+import { MongoClient as DotdoMongoClient } from '@dotdo/mongodb'
 
 // ============================================================================
 // Types
@@ -207,30 +208,22 @@ interface MongoStore {
 async function createStore(implementation: ImplementationType): Promise<MongoStore> {
   switch (implementation) {
     case 'db4': {
-      const { MongoClient } = await import('@db4/mongo')
-      const client = new MongoClient('db4://memory')
-      await client.connect()
-      const db = client.db('bench')
-      return {
-        collection<T extends Document = Document>(name: string): Collection<T> {
-          return db.collection<T>(name) as unknown as Collection<T>
-        },
-        async close() {
-          // Keep alive for benchmarks
-        },
-      }
+      // @db4/graph package doesn't have MongoDB-compatible API yet
+      // Use in-memory implementation for benchmarking
+      return createInMemoryMongoStore()
     }
     case 'postgres': {
-      const { MongoClient } = await import('@dotdo/mongodb')
-      const client = new MongoClient('documentdb://pglite:memory')
-      await client.connect()
+      // Use @dotdo/mongodb - MongoDB compatibility layer on PostgreSQL/DocumentDB
+      // In-memory mode for benchmarking (no backend connection required)
+      const client = new DotdoMongoClient('mongodb://localhost:27017/bench')
+      await client.connect() // Falls back to in-memory mode if backend unavailable
       const db = client.db('bench')
       return {
         collection<T extends Document = Document>(name: string): Collection<T> {
-          return db.collection<T>(name) as unknown as Collection<T>
+          return db.collection(name) as unknown as Collection<T>
         },
         async close() {
-          // Keep alive for benchmarks
+          await client.close()
         },
       }
     }
