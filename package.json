@@ -42,8 +42,9 @@
     "@db4/core": "^0.1.0",
     "@db4/do": "^0.1.0",
     "@dotdo/graphdb": "file:packages/graphdb",
-    "@dotdo/sdb": "file:packages/sdb",
     "@dotdo/poc-tigerbeetle-do": "file:packages/pocs/packages/tigerbeetle-do",
+    "@dotdo/sdb": "file:packages/sdb",
+    "@faker-js/faker": "^10.2.0",
     "evodb": "^0.1.0",
     "hono": "^4.7.0"
   },
