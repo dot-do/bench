@@ -14,16 +14,16 @@ compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Workers settings
-account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+account_id = "b6641681fe423910342b9ffa1364c76d"
 
 # Build settings
 [build]
-command = "npx esbuild stage-standards.ts --bundle --outfile=dist/stage-standards.js --format=esm --platform=browser"
+command = "npx esbuild worker/stage-standards.ts --bundle --outfile=dist/stage-standards.js --format=esm --platform=browser"
 
 # Performance settings for staging worker
 # Staging can take a long time with 200+ files
 [limits]
-cpu_ms = 600000  # 10 minutes max CPU time for full staging
+cpu_ms = 300000  # 5 minutes max CPU time (Cloudflare limit)
 
 # Observability
 [observability]
@@ -31,20 +31,24 @@ enabled = true
 head_sampling_rate = 1  # Full sampling for staging operations
 
 # =============================================================================
-# Container Binding - Staging Sandbox
+# Container Binding - Staging Sandbox (DISABLED - requires container setup)
 # =============================================================================
 
+# NOTE: Container binding disabled for initial deployment.
 # The staging container runs the conversion scripts in an isolated environment.
 # It has DuckDB, SQLite, and Node.js for running the conversion scripts.
-[[containers]]
-binding = "STAGING_CONTAINER"
-class_name = "StagingContainer"
-image = "./containers/dockerfiles/Dockerfile.staging"
-max_instances = 5
-default_port = 8080
-sleep_after = "30m"
-
-# Container size options (uncomment one):
+# To enable containers, you need to:
+# 1. Build and push the container image to a registry
+# 2. Update the image path below with the registry URL and tag
+# 3. Uncomment the [[containers]] block
+#
+# [[containers]]
+# binding = "STAGING_CONTAINER"
+# class_name = "StagingContainer"
+# image = "your-registry.io/staging-container:latest"
+# max_instances = 5
+#
+# Container size options:
 # size = "lite"           # 256MB RAM - for testing
 # size = "basic"          # 512MB RAM - light workloads
 # size = "standard-1"     # 1GB RAM   - default

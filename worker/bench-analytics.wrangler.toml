@@ -22,6 +22,7 @@
 # @see datasets/analytics/clickbench.ts
 
 name = "bench-analytics"
+account_id = "b6641681fe423910342b9ffa1364c76d"
 main = "bench-analytics.ts"
 compatibility_date = "2025-01-21"
 compatibility_flags = ["nodejs_compat"]

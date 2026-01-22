@@ -1,0 +1,222 @@
+# Staging Container for Standards Dataset Conversion
+# Converts TSV files to SQLite, JSONL, Parquet, and N-Triples formats
+FROM alpine:3.19
+
+# Install dependencies
+RUN apk add --no-cache \
+    nodejs \
+    npm \
+    curl \
+    wget \
+    unzip \
+    sqlite
+
+# Install DuckDB CLI for parquet conversion
+RUN wget https://github.com/duckdb/duckdb/releases/download/v1.0.0/duckdb_cli-linux-amd64.zip \
+    && unzip duckdb_cli-linux-amd64.zip \
+    && mv duckdb /usr/local/bin/ \
+    && chmod +x /usr/local/bin/duckdb \
+    && rm duckdb_cli-linux-amd64.zip
+
+# Create app directory
+WORKDIR /app
+
+# Create package.json
+RUN cat > /app/package.json << 'EOF'
+{
+  "name": "staging-container",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "duckdb": "^1.0.0"
+  }
+}
+EOF
+
+RUN npm install
+
+# Create the conversion server
+RUN cat > /app/server.mjs << 'SERVEREOF'
+import { createServer } from 'http';
+import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'fs';
+import { execSync } from 'child_process';
+import Database from 'better-sqlite3';
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  try {
+    // Health check
+    if (url.pathname === '/health' || url.pathname === '/ping') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'healthy', service: 'staging-container' }));
+      return;
+    }
+
+    // Conversion endpoint
+    if (url.pathname === '/convert' && req.method === 'POST') {
+      const body = await readBody(req);
+      const { filename, content, format } = JSON.parse(body);
+
+      if (!filename || !content || !format) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing filename, content, or format' }));
+        return;
+      }
+
+      const result = await convertTsv(filename, content, format);
+
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'X-Record-Count': String(result.recordCount),
+      });
+      res.end(Buffer.from(result.data));
+      return;
+    }
+
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+});
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', chunk => data += chunk);
+    req.on('end', () => resolve(data));
+  });
+}
+
+function parseTsv(content) {
+  const lines = content.trim().split('\n');
+  if (lines.length < 2) return { headers: [], rows: [] };
+
+  const headers = lines[0].split('\t');
+  const rows = lines.slice(1).map(line => {
+    const values = line.split('\t');
+    const row = {};
+    headers.forEach((h, i) => {
+      row[h] = values[i] || '';
+    });
+    return row;
+  });
+
+  return { headers, rows };
+}
+
+async function convertTsv(filename, content, format) {
+  const { headers, rows } = parseTsv(content);
+  const tableName = filename.replace('.tsv', '').replace(/[^a-zA-Z0-9_]/g, '_');
+  const tempDir = '/tmp';
+
+  switch (format) {
+    case 'jsonl': {
+      const jsonlContent = rows.map(row => JSON.stringify(row)).join('\n');
+      return { data: Buffer.from(jsonlContent), recordCount: rows.length };
+    }
+
+    case 'sqlite': {
+      const dbPath = `${tempDir}/${tableName}.db`;
+      if (existsSync(dbPath)) unlinkSync(dbPath);
+
+      const db = new Database(dbPath);
+
+      // Create table
+      const columnDefs = headers.map(h => `"${h}" TEXT`).join(', ');
+      db.exec(`CREATE TABLE "${tableName}" (${columnDefs})`);
+
+      // Insert rows
+      const placeholders = headers.map(() => '?').join(', ');
+      const insert = db.prepare(`INSERT INTO "${tableName}" VALUES (${placeholders})`);
+
+      const insertMany = db.transaction((rows) => {
+        for (const row of rows) {
+          insert.run(...headers.map(h => row[h]));
+        }
+      });
+      insertMany(rows);
+      db.close();
+
+      const data = readFileSync(dbPath);
+      unlinkSync(dbPath);
+      return { data, recordCount: rows.length };
+    }
+
+    case 'parquet': {
+      // Write TSV to temp file
+      const tsvPath = `${tempDir}/${tableName}.tsv`;
+      const parquetPath = `${tempDir}/${tableName}.parquet`;
+      writeFileSync(tsvPath, content);
+
+      // Use DuckDB to convert
+      execSync(`duckdb -c "COPY (SELECT * FROM read_csv_auto('${tsvPath}', delim='\\t', header=true)) TO '${parquetPath}' (FORMAT PARQUET)"`);
+
+      const data = readFileSync(parquetPath);
+      unlinkSync(tsvPath);
+      unlinkSync(parquetPath);
+      return { data, recordCount: rows.length };
+    }
+
+    case 'triples': {
+      // Convert to N-Triples format
+      const baseUri = `https://standards.org.ai/${tableName}`;
+      const triples = [];
+
+      rows.forEach((row, idx) => {
+        const subject = `<${baseUri}/row/${idx}>`;
+        headers.forEach(h => {
+          const predicate = `<${baseUri}/property/${encodeURIComponent(h)}>`;
+          const value = row[h] || '';
+          // Escape special characters in literal
+          const escapedValue = value
+            .replace(/\\/g, '\\\\')
+            .replace(/"/g, '\\"')
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\r')
+            .replace(/\t/g, '\\t');
+          const object = `"${escapedValue}"`;
+          triples.push(`${subject} ${predicate} ${object} .`);
+        });
+      });
+
+      return { data: Buffer.from(triples.join('\n')), recordCount: rows.length };
+    }
+
+    default:
+      throw new Error(`Unsupported format: ${format}`);
+  }
+}
+
+server.listen(8080, '0.0.0.0', () => {
+  console.log('Staging container listening on port 8080');
+});
+SERVEREOF
+
+# Create data directory
+RUN mkdir -p /data /tmp
+
+# Expose HTTP port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["node", "/app/server.mjs"]

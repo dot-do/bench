@@ -11,7 +11,7 @@ compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Workers settings
-account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+account_id = "b6641681fe423910342b9ffa1364c76d"
 
 # Build settings
 [build]
@@ -37,12 +37,9 @@ head_sampling_rate = 1  # Full sampling during benchmarks
 
 # PostgreSQL Container
 [[containers]]
-binding = "POSTGRES_CONTAINER"
 class_name = "PostgresContainer"
-image = "./containers/dockerfiles/Dockerfile.postgres"
+image = "../containers/dockerfiles/Dockerfile.postgres"
 max_instances = 10
-default_port = 8080
-sleep_after = "10m"
 
 # Size can be configured per-deployment:
 # lite:         256MB RAM, 0.25 vCPU - $0.0025/hr
@@ -55,39 +52,27 @@ sleep_after = "10m"
 
 # ClickHouse Container
 [[containers]]
-binding = "CLICKHOUSE_CONTAINER"
 class_name = "ClickHouseContainer"
-image = "./containers/dockerfiles/Dockerfile.clickhouse"
+image = "../containers/dockerfiles/Dockerfile.clickhouse"
 max_instances = 10
-default_port = 8123
-sleep_after = "10m"
 
 # MongoDB Container
 [[containers]]
-binding = "MONGO_CONTAINER"
 class_name = "MongoContainer"
-image = "./containers/dockerfiles/Dockerfile.mongo"
+image = "../containers/dockerfiles/Dockerfile.mongo"
 max_instances = 10
-default_port = 8080
-sleep_after = "10m"
 
 # DuckDB Container
 [[containers]]
-binding = "DUCKDB_CONTAINER"
 class_name = "DuckDBContainer"
-image = "./containers/dockerfiles/Dockerfile.duckdb"
+image = "../containers/dockerfiles/Dockerfile.duckdb"
 max_instances = 10
-default_port = 9999
-sleep_after = "10m"
 
 # SQLite Container
 [[containers]]
-binding = "SQLITE_CONTAINER"
 class_name = "SQLiteContainer"
-image = "./containers/dockerfiles/Dockerfile.sqlite"
+image = "../containers/dockerfiles/Dockerfile.sqlite"
 max_instances = 10
-default_port = 8080
-sleep_after = "10m"
 
 # =============================================================================
 # R2 Bucket for Results

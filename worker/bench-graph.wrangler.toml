@@ -14,6 +14,7 @@
 # Deploy: wrangler deploy -c worker/bench-graph.wrangler.toml
 
 name = "bench-graph"
+account_id = "b6641681fe423910342b9ffa1364c76d"
 main = "bench-graph.ts"
 compatibility_date = "2025-01-21"
 compatibility_flags = ["nodejs_compat"]

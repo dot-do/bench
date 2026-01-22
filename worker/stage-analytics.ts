@@ -1,388 +1,532 @@
 /**
  * Analytics Dataset Staging Worker
  *
- * A Cloudflare Worker that uses Sandbox SDK to download and stage large analytics
- * datasets like ClickBench and IMDB. Spins up sandbox containers with network access
- * to download from external sources and streams data directly to R2.
+ * A Cloudflare Worker that generates synthetic analytics datasets directly in-Worker.
+ * Uses deterministic seeding for reproducible data generation.
+ * Generated JSONL files are stored in R2 for benchmarking.
  *
  * Supported Datasets:
- * - clickbench: ClickBench hits.parquet (~14GB) - Web analytics benchmark data
- * - imdb: IMDB datasets (title.basics, name.basics, title.ratings) - Movie/TV data
+ * - clickbench: Synthetic web analytics data (page views, sessions, user events)
+ * - imdb: Synthetic movie/actor/ratings data
  *
- * Endpoint: POST /stage/{dataset}
- * - POST /stage/clickbench - Downloads ~14GB parquet file
- * - POST /stage/imdb - Downloads multiple TSV files (~2GB total uncompressed)
+ * Endpoint: POST /stage/{dataset}/{size}
+ * - POST /stage/clickbench/1mb - Generate ~1MB of web analytics data
+ * - POST /stage/imdb/10mb - Generate ~10MB of movie data
  *
- * @see scripts/download/clickbench.ts - ClickBench download logic
- * @see scripts/download/imdb.ts - IMDB download logic
- * @see https://datasets.clickhouse.com/hits_compatible/
- * @see https://datasets.imdbws.com/
+ * Size options: 1mb, 10mb, 100mb, 1gb
  */
 
 import { Hono } from 'hono'
 
 // Environment bindings
 interface Env {
-  // R2 bucket for storing downloaded datasets
+  // R2 bucket for storing generated datasets
   ANALYTICS_BUCKET: R2Bucket
-  // Sandbox API token for authentication
-  DO_TOKEN: string
-  // Sandbox API base URL (optional, defaults to api.do)
-  SANDBOX_API_URL?: string
 }
 
 // Valid dataset types
 type DatasetType = 'clickbench' | 'imdb'
 
+// Valid size options
+type SizeOption = '1mb' | '10mb' | '100mb' | '1gb'
+
 // Dataset configuration
 interface DatasetConfig {
   name: string
   description: string
-  files: Array<{
-    name: string
-    url: string
-    compressed?: boolean
-    expectedSize?: number // in bytes, approximate
-  }>
-  totalSize: string // Human-readable total size
-  downloadTimeout: number // milliseconds
-  memoryMb: number // Memory required for sandbox
+  tables: string[]
 }
 
 const DATASET_CONFIGS: Record<DatasetType, DatasetConfig> = {
   clickbench: {
     name: 'ClickBench',
-    description: 'Web analytics benchmark dataset (~100M rows of anonymized web analytics)',
-    files: [
-      {
-        name: 'hits.parquet',
-        url: 'https://datasets.clickhouse.com/hits_compatible/hits.parquet',
-        expectedSize: 14_779_976_446, // ~14.8 GB
-      },
-    ],
-    totalSize: '~14 GB',
-    downloadTimeout: 1800000, // 30 minutes
-    memoryMb: 4096, // 4GB for large file streaming
+    description: 'Synthetic web analytics benchmark data (page views, sessions, events)',
+    tables: ['hits'],
   },
   imdb: {
     name: 'IMDB',
-    description: 'IMDB movie/TV datasets (titles, names, ratings)',
-    files: [
-      {
-        name: 'title.basics.tsv.gz',
-        url: 'https://datasets.imdbws.com/title.basics.tsv.gz',
-        compressed: true,
-        expectedSize: 150_000_000, // ~150 MB compressed, ~700 MB uncompressed
-      },
-      {
-        name: 'name.basics.tsv.gz',
-        url: 'https://datasets.imdbws.com/name.basics.tsv.gz',
-        compressed: true,
-        expectedSize: 250_000_000, // ~250 MB compressed, ~800 MB uncompressed
-      },
-      {
-        name: 'title.ratings.tsv.gz',
-        url: 'https://datasets.imdbws.com/title.ratings.tsv.gz',
-        compressed: true,
-        expectedSize: 7_000_000, // ~7 MB compressed, ~25 MB uncompressed
-      },
-    ],
-    totalSize: '~400 MB compressed (~1.5 GB uncompressed)',
-    downloadTimeout: 600000, // 10 minutes
-    memoryMb: 2048, // 2GB for decompression
+    description: 'Synthetic movie/TV data (titles, names, ratings)',
+    tables: ['title_basics', 'name_basics', 'title_ratings'],
   },
 }
 
-// Sandbox API client
-class SandboxClient {
-  private baseUrl: string
-  private token: string
+// Size validation
+const VALID_SIZES: SizeOption[] = ['1mb', '10mb', '100mb', '1gb']
 
-  constructor(token: string, baseUrl = 'https://api.do') {
-    this.token = token
-    this.baseUrl = baseUrl
-  }
+// =============================================================================
+// Deterministic Random Number Generator (Mulberry32)
+// =============================================================================
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.token}`,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    })
-
-    if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`Sandbox API error: ${response.status} ${error}`)
-    }
-
-    return response.json()
-  }
-
-  /**
-   * Create a new sandbox environment with network access
-   */
-  async create(options: {
-    name: string
-    runtime: 'node'
-    memory?: number
-    timeout?: number
-    networkAccess: boolean
-  }): Promise<{ id: string; name: string; status: string }> {
-    return this.request('POST', '/sandboxs', {
-      name: options.name,
-      type: 'vm',
-      runtime: options.runtime,
-      memory: options.memory ?? 2048,
-      timeout: options.timeout ?? 600000, // 10 minutes default
-      networkAccess: options.networkAccess, // Required for downloading
-      fileSystem: true,
-    })
-  }
-
-  /**
-   * Execute code in a sandbox
-   */
-  async execute(
-    sandboxId: string,
-    options: {
-      code: string
-      language?: 'typescript' | 'javascript'
-    }
-  ): Promise<{ output: string; exitCode: number; duration: number }> {
-    return this.request('POST', `/sandboxs/${sandboxId}/execute`, {
-      code: options.code,
-      language: options.language ?? 'javascript',
-    })
-  }
-
-  /**
-   * Run a shell command in a sandbox
-   */
-  async run(
-    sandboxId: string,
-    command: string
-  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    return this.request('POST', `/sandboxs/${sandboxId}/run`, {
-      command,
-    })
-  }
-
-  /**
-   * Read a file from the sandbox as a stream
-   * Returns file info and can be used to stream content to R2
-   */
-  async readFileStream(
-    sandboxId: string,
-    path: string
-  ): Promise<Response> {
-    const response = await fetch(`${this.baseUrl}/sandboxs/${sandboxId}/files${path}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-      },
-    })
-
-    if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`Failed to read file: ${response.status} ${error}`)
-    }
-
-    return response
-  }
-
-  /**
-   * Get file info from the sandbox
-   */
-  async statFile(
-    sandboxId: string,
-    path: string
-  ): Promise<{ size: number; exists: boolean }> {
-    return this.request('POST', `/sandboxs/${sandboxId}/stat`, {
-      path,
-    })
-  }
-
-  /**
-   * Delete a sandbox
-   */
-  async delete(sandboxId: string): Promise<void> {
-    await this.request('DELETE', `/sandboxs/${sandboxId}`)
+function createRng(seed: number): () => number {
+  return function () {
+    let t = (seed += 0x6d2b79f5)
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
   }
 }
 
-/**
- * Generate the download script to run in the sandbox
- * This script downloads files and stores them in /output directory
- */
-function getDownloadScript(dataset: DatasetType): string {
-  const config = DATASET_CONFIGS[dataset]
-
-  const baseCode = `
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-const http = require('http');
-const zlib = require('zlib');
-const { pipeline } = require('stream/promises');
-
-const OUTPUT_DIR = '/output';
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+function pick<T>(arr: T[], rng: () => number): T {
+  return arr[Math.floor(rng() * arr.length)]
 }
 
-function downloadFile(url, destPath, decompress = false) {
-  return new Promise((resolve, reject) => {
-    console.log('Downloading: ' + url);
-    console.log('Destination: ' + destPath);
+function generateTimestamp(rng: () => number, startYear: number, endYear: number): string {
+  const start = new Date(startYear, 0, 1).getTime()
+  const end = new Date(endYear, 11, 31).getTime()
+  const timestamp = new Date(start + rng() * (end - start))
+  return timestamp.toISOString()
+}
 
-    const protocol = url.startsWith('https') ? https : http;
+function generateUnixTimestamp(rng: () => number, startYear: number, endYear: number): number {
+  const start = new Date(startYear, 0, 1).getTime()
+  const end = new Date(endYear, 11, 31).getTime()
+  return Math.floor((start + rng() * (end - start)) / 1000)
+}
 
-    const request = protocol.get(url, (response) => {
-      // Handle redirects
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        console.log('Redirecting to: ' + response.headers.location);
-        return downloadFile(response.headers.location, destPath, decompress).then(resolve).catch(reject);
+// =============================================================================
+// ClickBench Dataset Generator
+// Simulates web analytics data similar to the real ClickBench hits dataset
+// =============================================================================
+
+const CLICKBENCH_SEED = 56789
+
+const CLICKBENCH_SIZE_CONFIGS: Record<SizeOption, { hits: number }> = {
+  '1mb': { hits: 2000 },
+  '10mb': { hits: 20000 },
+  '100mb': { hits: 200000 },
+  '1gb': { hits: 2000000 },
+}
+
+// ClickBench-style data arrays
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0.4472.124',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/91.0.4472.114',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15',
+  'Mozilla/5.0 (iPad; CPU OS 14_6 like Mac OS X) AppleWebKit/605.1.15',
+  'Mozilla/5.0 (Android 11; Mobile; rv:89.0) Gecko/89.0 Firefox/89.0',
+]
+
+const REFERER_DOMAINS = [
+  'google.com', 'facebook.com', 'twitter.com', 'youtube.com', 'reddit.com',
+  'linkedin.com', 'instagram.com', 'pinterest.com', 'bing.com', 'yahoo.com',
+  'tiktok.com', 'amazon.com', 'wikipedia.org', 'baidu.com', 'yandex.ru',
+]
+
+const URL_PATHS = [
+  '/', '/products', '/about', '/contact', '/blog', '/news', '/shop',
+  '/category/electronics', '/category/clothing', '/category/home',
+  '/product/123', '/product/456', '/product/789', '/cart', '/checkout',
+  '/search', '/account', '/login', '/register', '/help', '/faq',
+]
+
+const SEARCH_PHRASES = [
+  'best laptop 2024', 'cheap flights', 'weather today', 'news headlines',
+  'recipe chicken', 'how to cook', 'buy shoes online', 'smartphone deals',
+  'movie reviews', 'sports scores', 'stock market', 'travel destinations',
+  '', '', '', '', // empty searches are common
+]
+
+const COUNTRIES = ['US', 'GB', 'DE', 'FR', 'CA', 'AU', 'JP', 'BR', 'IN', 'RU', 'CN', 'ES', 'IT', 'NL', 'PL']
+const REGIONS = ['California', 'Texas', 'New York', 'Florida', 'Illinois', 'London', 'Bavaria', 'Paris', 'Ontario', 'Victoria']
+const CITIES = ['Los Angeles', 'Houston', 'New York', 'Miami', 'Chicago', 'London', 'Munich', 'Paris', 'Toronto', 'Melbourne']
+
+const OS_NAMES = ['Windows', 'Mac OS X', 'Linux', 'iOS', 'Android']
+const BROWSERS = ['Chrome', 'Safari', 'Firefox', 'Edge', 'Opera']
+const DEVICE_TYPES = ['desktop', 'mobile', 'tablet']
+
+const TRAFFIC_SOURCES = ['organic', 'paid', 'direct', 'referral', 'social', 'email']
+const EVENT_TYPES = ['pageview', 'click', 'scroll', 'form_submit', 'add_to_cart', 'purchase', 'video_play']
+
+interface ClickBenchData {
+  hits: string
+}
+
+function generateClickBenchData(size: SizeOption): ClickBenchData {
+  const config = CLICKBENCH_SIZE_CONFIGS[size]
+  const rng = createRng(CLICKBENCH_SEED)
+
+  const hits: string[] = []
+
+  // Generate user IDs for realistic session distribution
+  const numUsers = Math.max(100, Math.floor(config.hits / 10))
+  const userIds: number[] = []
+  for (let i = 0; i < numUsers; i++) {
+    userIds.push(Math.floor(rng() * 2147483647))
+  }
+
+  for (let i = 0; i < config.hits; i++) {
+    const userId = pick(userIds, rng)
+    const eventTime = generateUnixTimestamp(rng, 2020, 2024)
+    const isNewUser = rng() < 0.3
+    const countryCode = pick(COUNTRIES, rng)
+    const regionIdx = Math.floor(rng() * REGIONS.length)
+    const deviceType = pick(DEVICE_TYPES, rng)
+    const isMobile = deviceType === 'mobile' || deviceType === 'tablet'
+
+    // Generate realistic session data
+    const sessionDuration = Math.floor(rng() * 1800) // 0-30 minutes
+    const pageViews = Math.floor(rng() * 20) + 1
+    const bounced = rng() < 0.4
+
+    // Screen resolution based on device type
+    const resolutions = isMobile
+      ? [[375, 812], [414, 896], [390, 844], [360, 800]]
+      : [[1920, 1080], [1366, 768], [1536, 864], [1440, 900], [2560, 1440]]
+    const [resWidth, resHeight] = pick(resolutions, rng)
+
+    // Generate click/scroll data
+    const clientX = Math.floor(rng() * resWidth)
+    const clientY = Math.floor(rng() * resHeight)
+
+    const hit = {
+      WatchID: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      JavaEnable: rng() > 0.1 ? 1 : 0,
+      Title: `Page Title ${Math.floor(rng() * 1000)}`,
+      GoodEvent: rng() > 0.02 ? 1 : 0, // 98% good events
+      EventTime: eventTime,
+      EventDate: Math.floor(eventTime / 86400) * 86400,
+      CounterID: Math.floor(rng() * 10000),
+      ClientIP: Math.floor(rng() * 4294967295),
+      CounterClass: Math.floor(rng() * 5),
+      OS: pick(OS_NAMES, rng),
+      UserAgent: pick(USER_AGENTS, rng),
+      URL: `https://example.com${pick(URL_PATHS, rng)}`,
+      Referer: rng() > 0.3 ? `https://${pick(REFERER_DOMAINS, rng)}/` : '',
+      URLDomain: 'example.com',
+      RefererDomain: rng() > 0.3 ? pick(REFERER_DOMAINS, rng) : '',
+      IsRefresh: rng() < 0.05 ? 1 : 0,
+      IsLink: rng() < 0.3 ? 1 : 0,
+      IsDownload: rng() < 0.02 ? 1 : 0,
+      IsNotBounce: bounced ? 0 : 1,
+      FUniqID: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      HID: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      IsOldCounter: rng() < 0.1 ? 1 : 0,
+      IsEvent: pick(EVENT_TYPES, rng) !== 'pageview' ? 1 : 0,
+      IsParameter: rng() < 0.2 ? 1 : 0,
+      DontCountHits: rng() < 0.01 ? 1 : 0,
+      WithHash: rng() < 0.1 ? 1 : 0,
+      HitColor: pick(['R', 'G', 'B', 'W'], rng),
+      UTCEventTime: eventTime,
+      Age: Math.floor(rng() * 80) + 18,
+      Sex: Math.floor(rng() * 3), // 0=unknown, 1=male, 2=female
+      Income: Math.floor(rng() * 5),
+      Interests: Math.floor(rng() * 1000),
+      Robotness: rng() < 0.02 ? Math.floor(rng() * 100) : 0,
+      GeneralInterests: Math.floor(rng() * 100),
+      RemoteIP: Math.floor(rng() * 4294967295),
+      RemoteIP6: '::ffff:' + [Math.floor(rng() * 256), Math.floor(rng() * 256), Math.floor(rng() * 256), Math.floor(rng() * 256)].join('.'),
+      WindowName: Math.floor(rng() * 10),
+      OpenerName: Math.floor(rng() * 10),
+      HistoryLength: Math.floor(rng() * 20),
+      BrowserLanguage: pick(['en', 'en-US', 'en-GB', 'de', 'fr', 'es', 'zh', 'ja', 'ru', 'pt'], rng),
+      BrowserCountry: countryCode,
+      SocialNetwork: pick(['', '', '', 'Facebook', 'Twitter', 'Instagram', 'LinkedIn'], rng),
+      SocialAction: pick(['', '', '', 'like', 'share', 'comment'], rng),
+      HTTPError: rng() < 0.01 ? pick([404, 500, 502, 503], rng) : 0,
+      SendTiming: Math.floor(rng() * 1000),
+      DNSTiming: Math.floor(rng() * 100),
+      ConnectTiming: Math.floor(rng() * 200),
+      ResponseStartTiming: Math.floor(rng() * 500),
+      ResponseEndTiming: Math.floor(rng() * 2000),
+      FetchTiming: Math.floor(rng() * 100),
+      RedirectTiming: rng() < 0.2 ? Math.floor(rng() * 500) : 0,
+      DOMInteractiveTiming: Math.floor(rng() * 3000),
+      DOMContentLoadedTiming: Math.floor(rng() * 4000),
+      DOMCompleteTiming: Math.floor(rng() * 5000),
+      LoadEventStartTiming: Math.floor(rng() * 5500),
+      LoadEventEndTiming: Math.floor(rng() * 6000),
+      NSToDOMContentLoadedTiming: Math.floor(rng() * 4000),
+      FirstPaintTiming: Math.floor(rng() * 2000),
+      RedirectCount: rng() < 0.1 ? Math.floor(rng() * 3) : 0,
+      SocialSourceNetworkID: Math.floor(rng() * 10),
+      SocialSourcePage: '',
+      ParamPrice: Math.floor(rng() * 100000),
+      ParamOrderID: rng() < 0.1 ? String(Math.floor(rng() * 1000000)) : '',
+      ParamCurrency: pick(['USD', 'EUR', 'GBP', 'JPY', 'CNY', ''], rng),
+      ParamCurrencyID: Math.floor(rng() * 10),
+      GoalsReached: Math.floor(rng() * 10),
+      OpenstatServiceName: '',
+      OpenstatCampaignID: '',
+      OpenstatAdID: '',
+      OpenstatSourceID: '',
+      UTMSource: pick(['', '', 'google', 'facebook', 'twitter', 'newsletter'], rng),
+      UTMMedium: pick(['', '', 'cpc', 'organic', 'social', 'email'], rng),
+      UTMCampaign: pick(['', '', 'summer_sale', 'black_friday', 'new_product'], rng),
+      UTMContent: '',
+      UTMTerm: pick(SEARCH_PHRASES, rng),
+      FromTag: '',
+      HasGCLID: rng() < 0.1 ? 1 : 0,
+      RefererHash: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      URLHash: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      CLID: Math.floor(rng() * 1000000),
+      YCLID: Math.floor(rng() * 1000000),
+      ShareService: '',
+      ShareURL: '',
+      ShareTitle: '',
+      ParsedParamsKey1: '',
+      ParsedParamsKey2: '',
+      ParsedParamsKey3: '',
+      ParsedParamsKey4: '',
+      ParsedParamsKey5: '',
+      ParsedParamsValueDouble: 0,
+      IsLandmark: rng() < 0.05 ? 1 : 0,
+      RequestNum: Math.floor(rng() * 100),
+      RequestTry: Math.floor(rng() * 3),
+      UserID: userId,
+      SessionID: Math.floor(rng() * Number.MAX_SAFE_INTEGER),
+      PageViews: pageViews,
+      SessionDuration: sessionDuration,
+      TrafficSource: pick(TRAFFIC_SOURCES, rng),
+      DeviceType: deviceType,
+      ScreenWidth: resWidth,
+      ScreenHeight: resHeight,
+      ClientX: clientX,
+      ClientY: clientY,
+      Country: countryCode,
+      Region: REGIONS[regionIdx],
+      City: CITIES[regionIdx % CITIES.length],
+      Browser: pick(BROWSERS, rng),
+      IsNewUser: isNewUser ? 1 : 0,
+    }
+
+    hits.push(JSON.stringify(hit))
+  }
+
+  return {
+    hits: hits.join('\n'),
+  }
+}
+
+// =============================================================================
+// IMDB Dataset Generator
+// Simulates movie/TV/person data similar to real IMDB datasets
+// =============================================================================
+
+const IMDB_SEED = 67890
+
+const IMDB_SIZE_CONFIGS: Record<SizeOption, { titles: number; names: number; ratings: number }> = {
+  '1mb': { titles: 2000, names: 3000, ratings: 1500 },
+  '10mb': { titles: 20000, names: 30000, ratings: 15000 },
+  '100mb': { titles: 200000, names: 300000, ratings: 150000 },
+  '1gb': { titles: 2000000, names: 3000000, ratings: 1500000 },
+}
+
+// IMDB-style data arrays
+const TITLE_TYPES = ['movie', 'tvSeries', 'tvEpisode', 'tvMovie', 'tvMiniSeries', 'short', 'videoGame', 'video']
+const GENRES = [
+  'Drama', 'Comedy', 'Action', 'Adventure', 'Horror', 'Thriller', 'Romance',
+  'Sci-Fi', 'Fantasy', 'Mystery', 'Crime', 'Documentary', 'Animation',
+  'Family', 'Biography', 'History', 'War', 'Music', 'Musical', 'Western',
+  'Sport', 'Film-Noir', 'News', 'Reality-TV', 'Talk-Show', 'Game-Show',
+]
+
+const MOVIE_WORDS = [
+  'The', 'A', 'Love', 'Death', 'Life', 'Night', 'Day', 'Dark', 'Light', 'Last',
+  'First', 'Final', 'Secret', 'Hidden', 'Lost', 'Found', 'Return', 'Rise', 'Fall',
+  'Journey', 'Quest', 'Legend', 'Story', 'Tale', 'Chronicles', 'Adventures',
+  'Blood', 'Fire', 'Ice', 'Storm', 'Shadow', 'Sun', 'Moon', 'Star', 'World',
+  'Empire', 'Kingdom', 'House', 'Family', 'Brothers', 'Sisters', 'Father', 'Mother',
+]
+
+const FIRST_NAMES_ACTORS = [
+  'John', 'Michael', 'David', 'James', 'Robert', 'William', 'Christopher', 'Daniel',
+  'Emma', 'Olivia', 'Sophia', 'Isabella', 'Mia', 'Charlotte', 'Amelia', 'Harper',
+  'Tom', 'Chris', 'Brad', 'Leonardo', 'Meryl', 'Cate', 'Jennifer', 'Scarlett',
+  'Denzel', 'Samuel', 'Morgan', 'Anthony', 'Viola', 'Lupita', 'Octavia', 'Halle',
+]
+
+const LAST_NAMES_ACTORS = [
+  'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Miller', 'Davis', 'Wilson',
+  'Anderson', 'Taylor', 'Moore', 'Jackson', 'Martin', 'Lee', 'Thompson', 'White',
+  'Hanks', 'Cruise', 'Pitt', 'DiCaprio', 'Streep', 'Blanchett', 'Lawrence', 'Johansson',
+  'Washington', 'Freeman', 'Hopkins', 'Davis', 'Nyongo', 'Spencer', 'Berry',
+]
+
+const PROFESSIONS = [
+  'actor', 'actress', 'director', 'producer', 'writer', 'composer', 'cinematographer',
+  'editor', 'production_designer', 'costume_designer', 'make_up_department',
+  'sound_department', 'visual_effects', 'stunts', 'miscellaneous',
+]
+
+interface ImdbData {
+  title_basics: string
+  name_basics: string
+  title_ratings: string
+}
+
+function generateImdbData(size: SizeOption): ImdbData {
+  const config = IMDB_SIZE_CONFIGS[size]
+  const rng = createRng(IMDB_SEED)
+
+  // Generate title IDs for reference
+  const titleIds: string[] = []
+  for (let i = 0; i < config.titles; i++) {
+    titleIds.push(`tt${String(i + 1).padStart(7, '0')}`)
+  }
+
+  // Generate name IDs for reference
+  const nameIds: string[] = []
+  for (let i = 0; i < config.names; i++) {
+    nameIds.push(`nm${String(i + 1).padStart(7, '0')}`)
+  }
+
+  // Generate title.basics
+  const titleBasics: string[] = []
+  for (let i = 0; i < config.titles; i++) {
+    const titleType = pick(TITLE_TYPES, rng)
+    const isAdult = rng() < 0.05 ? 1 : 0
+    const startYear = 1900 + Math.floor(rng() * 125) // 1900-2024
+    const endYear = titleType.includes('Series') && rng() > 0.3
+      ? startYear + Math.floor(rng() * 15)
+      : null
+    const runtimeMinutes = titleType === 'short'
+      ? Math.floor(rng() * 30) + 5
+      : titleType === 'movie'
+      ? Math.floor(rng() * 150) + 60
+      : titleType.includes('Episode')
+      ? Math.floor(rng() * 45) + 20
+      : Math.floor(rng() * 120) + 30
+
+    // Generate title
+    const numWords = Math.floor(rng() * 4) + 1
+    const words: string[] = []
+    for (let w = 0; w < numWords; w++) {
+      words.push(pick(MOVIE_WORDS, rng))
+    }
+    const primaryTitle = words.join(' ')
+
+    // Generate genres (1-3 genres)
+    const numGenres = Math.floor(rng() * 3) + 1
+    const selectedGenres: string[] = []
+    for (let g = 0; g < numGenres; g++) {
+      const genre = pick(GENRES, rng)
+      if (!selectedGenres.includes(genre)) {
+        selectedGenres.push(genre)
       }
+    }
 
-      if (response.statusCode !== 200) {
-        return reject(new Error('Download failed with status: ' + response.statusCode));
+    titleBasics.push(JSON.stringify({
+      tconst: titleIds[i],
+      titleType,
+      primaryTitle,
+      originalTitle: rng() > 0.3 ? primaryTitle : `${primaryTitle} (Original)`,
+      isAdult,
+      startYear,
+      endYear,
+      runtimeMinutes,
+      genres: selectedGenres.join(','),
+    }))
+  }
+
+  // Generate name.basics
+  const nameBasics: string[] = []
+  for (let i = 0; i < config.names; i++) {
+    const firstName = pick(FIRST_NAMES_ACTORS, rng)
+    const lastName = pick(LAST_NAMES_ACTORS, rng)
+    const primaryName = `${firstName} ${lastName}`
+
+    const birthYear = 1920 + Math.floor(rng() * 85) // 1920-2004
+    const deathYear = rng() < 0.2 && birthYear < 1970
+      ? birthYear + Math.floor(rng() * 80) + 20
+      : null
+
+    // Generate professions (1-3)
+    const numProfessions = Math.floor(rng() * 3) + 1
+    const selectedProfessions: string[] = []
+    for (let p = 0; p < numProfessions; p++) {
+      const profession = pick(PROFESSIONS, rng)
+      if (!selectedProfessions.includes(profession)) {
+        selectedProfessions.push(profession)
       }
+    }
 
-      const contentLength = response.headers['content-length'];
-      const totalSize = contentLength ? parseInt(contentLength, 10) : null;
-      let downloaded = 0;
-      let lastLog = Date.now();
+    // Known for titles (0-4 titles)
+    const numKnownFor = Math.floor(rng() * 5)
+    const knownForTitles: string[] = []
+    for (let k = 0; k < numKnownFor; k++) {
+      knownForTitles.push(pick(titleIds, rng))
+    }
 
-      console.log('Content-Length: ' + (totalSize ? formatBytes(totalSize) : 'unknown'));
+    nameBasics.push(JSON.stringify({
+      nconst: nameIds[i],
+      primaryName,
+      birthYear,
+      deathYear,
+      primaryProfession: selectedProfessions.join(','),
+      knownForTitles: knownForTitles.join(','),
+    }))
+  }
 
-      // Create write stream, optionally with decompression
-      const writeStream = fs.createWriteStream(destPath);
-      let sourceStream = response;
+  // Generate title.ratings
+  const titleRatings: string[] = []
+  const ratedTitles = new Set<string>()
 
-      if (decompress) {
-        console.log('Decompressing gzip stream...');
-        const gunzip = zlib.createGunzip();
-        sourceStream = response.pipe(gunzip);
-      }
-
-      response.on('data', (chunk) => {
-        downloaded += chunk.length;
-        const now = Date.now();
-        if (now - lastLog >= 5000) { // Log every 5 seconds
-          const progress = totalSize ? ((downloaded / totalSize) * 100).toFixed(1) + '%' : formatBytes(downloaded);
-          console.log('Progress: ' + formatBytes(downloaded) + ' / ' + (totalSize ? formatBytes(totalSize) : 'unknown') + ' (' + progress + ')');
-          lastLog = now;
+  for (let i = 0; i < config.ratings; i++) {
+    // Pick a title that hasn't been rated yet (or allow duplicates for simplicity)
+    const titleId = pick(titleIds, rng)
+    if (ratedTitles.has(titleId) && ratedTitles.size < titleIds.length * 0.9) {
+      // Try to find an unrated title
+      for (const tid of titleIds) {
+        if (!ratedTitles.has(tid)) {
+          ratedTitles.add(tid)
+          break
         }
-      });
+      }
+    }
+    ratedTitles.add(titleId)
 
-      sourceStream.pipe(writeStream);
+    // Generate realistic rating distribution (bell curve around 6-7)
+    const u1 = rng()
+    const u2 = rng()
+    const gaussian = Math.sqrt(-2 * Math.log(u1 + 0.0001)) * Math.cos(2 * Math.PI * u2)
+    const averageRating = Math.max(1, Math.min(10, 6.5 + gaussian * 1.5))
 
-      writeStream.on('finish', () => {
-        const stats = fs.statSync(destPath);
-        console.log('Download complete: ' + destPath);
-        console.log('Final size: ' + formatBytes(stats.size));
-        resolve({ path: destPath, size: stats.size });
-      });
+    // Number of votes follows power law (most have few votes, some have millions)
+    const voteTier = rng()
+    const numVotes = voteTier < 0.7
+      ? Math.floor(rng() * 1000) + 5
+      : voteTier < 0.9
+      ? Math.floor(rng() * 50000) + 1000
+      : voteTier < 0.98
+      ? Math.floor(rng() * 500000) + 50000
+      : Math.floor(rng() * 2000000) + 500000
 
-      writeStream.on('error', reject);
-      sourceStream.on('error', reject);
-    });
-
-    request.on('error', reject);
-    request.setTimeout(1800000, () => { // 30 minute timeout
-      request.destroy();
-      reject(new Error('Download timeout'));
-    });
-  });
-}
-
-async function main() {
-  const results = [];
-  const errors = [];
-`
-
-  // Generate download calls for each file
-  let downloadCalls = ''
-  for (const file of config.files) {
-    const destName = file.compressed ? file.name.replace('.gz', '') : file.name
-    const destPath = `/output/${destName}`
-    downloadCalls += `
-  try {
-    console.log('\\n=== Downloading ${file.name} ===');
-    const result = await downloadFile(
-      '${file.url}',
-      '${destPath}',
-      ${file.compressed ? 'true' : 'false'}
-    );
-    results.push({
-      name: '${destName}',
-      originalName: '${file.name}',
-      size: result.size,
-      path: result.path,
-    });
-  } catch (error) {
-    console.error('Failed to download ${file.name}:', error.message);
-    errors.push({
-      name: '${file.name}',
-      error: error.message,
-    });
-  }
-`
+    titleRatings.push(JSON.stringify({
+      tconst: titleId,
+      averageRating: Math.round(averageRating * 10) / 10,
+      numVotes,
+    }))
   }
 
-  const endCode = `
-  console.log('\\n=== Download Summary ===');
-  console.log('Successful: ' + results.length);
-  console.log('Failed: ' + errors.length);
-
-  // Output JSON result for parsing
-  console.log('\\n__RESULT_JSON__');
-  console.log(JSON.stringify({ success: errors.length === 0, results, errors }));
-}
-
-main().catch((error) => {
-  console.error('Fatal error:', error);
-  console.log('\\n__RESULT_JSON__');
-  console.log(JSON.stringify({ success: false, results: [], errors: [{ name: 'fatal', error: error.message }] }));
-  process.exit(1);
-});
-`
-
-  return baseCode + downloadCalls + endCode
-}
-
-/**
- * Parse the result JSON from sandbox output
- */
-function parseDownloadResult(output: string): {
-  success: boolean
-  results: Array<{ name: string; originalName: string; size: number; path: string }>
-  errors: Array<{ name: string; error: string }>
-} {
-  const marker = '__RESULT_JSON__'
-  const markerIndex = output.indexOf(marker)
-
-  if (markerIndex === -1) {
-    throw new Error('Could not find result marker in sandbox output')
+  return {
+    title_basics: titleBasics.join('\n'),
+    name_basics: nameBasics.join('\n'),
+    title_ratings: titleRatings.join('\n'),
   }
+}
 
-  const jsonStr = output.slice(markerIndex + marker.length).trim().split('\n')[0]
-  return JSON.parse(jsonStr)
+// =============================================================================
+// Dataset Generation Dispatcher
+// =============================================================================
+
+type DatasetData = ClickBenchData | ImdbData
+
+function generateDataset(dataset: DatasetType, size: SizeOption): DatasetData {
+  switch (dataset) {
+    case 'clickbench':
+      return generateClickBenchData(size)
+    case 'imdb':
+      return generateImdbData(size)
+  }
 }
 
 // Response types
 interface StageResult {
   success: boolean
   dataset: DatasetType
+  size: SizeOption
   duration: number
   files: Array<{
     name: string
@@ -391,7 +535,15 @@ interface StageResult {
   }>
   totalSize: number
   error?: string
-  sandboxLogs?: string
+}
+
+// Utility function for formatting bytes
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
 // Create Hono app
@@ -407,21 +559,16 @@ app.get('/datasets', (c) => {
   return c.json({
     datasets: Object.entries(DATASET_CONFIGS).map(([key, config]) => ({
       id: key,
-      name: config.name,
-      description: config.description,
-      totalSize: config.totalSize,
-      files: config.files.map((f) => ({
-        name: f.name,
-        expectedSize: f.expectedSize,
-        compressed: f.compressed ?? false,
-      })),
+      ...config,
+      sizes: VALID_SIZES,
     })),
   })
 })
 
-// Stage a dataset
-app.post('/stage/:dataset', async (c) => {
+// Stage a dataset (with size parameter)
+app.post('/stage/:dataset/:size', async (c) => {
   const dataset = c.req.param('dataset') as DatasetType
+  const size = c.req.param('size') as SizeOption
   const startTime = Date.now()
 
   // Validate dataset
@@ -435,13 +582,24 @@ app.post('/stage/:dataset', async (c) => {
     )
   }
 
+  // Validate size
+  if (!VALID_SIZES.includes(size)) {
+    return c.json(
+      {
+        success: false,
+        error: `Invalid size: ${size}. Valid options: ${VALID_SIZES.join(', ')}`,
+      },
+      400
+    )
+  }
+
   const config = DATASET_CONFIGS[dataset]
 
   // Check if dataset already exists in R2
-  const existingPrefix = `analytics/${dataset}/`
+  const existingPrefix = `analytics/${dataset}/${size}/`
   const existingFiles = await c.env.ANALYTICS_BUCKET.list({ prefix: existingPrefix })
 
-  if (existingFiles.objects.length >= config.files.length) {
+  if (existingFiles.objects.length >= config.tables.length) {
     // Return existing dataset info
     const files = existingFiles.objects.map((obj) => ({
       name: obj.key.split('/').pop()!,
@@ -454,6 +612,7 @@ app.post('/stage/:dataset', async (c) => {
       success: true,
       cached: true,
       dataset,
+      size,
       duration: Date.now() - startTime,
       files,
       totalSize,
@@ -461,94 +620,49 @@ app.post('/stage/:dataset', async (c) => {
     })
   }
 
-  // Create sandbox client
-  const sandbox = new SandboxClient(
-    c.env.DO_TOKEN,
-    c.env.SANDBOX_API_URL || 'https://api.do'
-  )
-
-  let sandboxId: string | null = null
-  let sandboxLogs = ''
-
   try {
-    // Create sandbox with network access
-    console.log(`Creating sandbox for ${dataset} with network access...`)
-    const created = await sandbox.create({
-      name: `analytics-${dataset}-${Date.now()}`,
-      runtime: 'node',
-      memory: config.memoryMb,
-      timeout: config.downloadTimeout,
-      networkAccess: true, // Required for external downloads
-    })
-    sandboxId = created.id
-    console.log(`Sandbox created: ${sandboxId}`)
+    // Generate dataset in-worker
+    console.log(`Generating ${dataset} dataset (${size}) in-worker...`)
+    const data = generateDataset(dataset, size)
+    const generationTime = Date.now() - startTime
+    console.log(`Generation complete in ${generationTime}ms`)
 
-    // Execute download script
-    console.log(`Executing download script for ${dataset}...`)
-    const script = getDownloadScript(dataset)
-    const result = await sandbox.execute(sandboxId, {
-      code: script,
-      language: 'javascript',
-    })
-
-    sandboxLogs = result.output
-    console.log(`Script execution complete. Exit code: ${result.exitCode}, Duration: ${result.duration}ms`)
-
-    // Parse result
-    const downloadResult = parseDownloadResult(result.output)
-
-    if (!downloadResult.success || downloadResult.errors.length > 0) {
-      const errorMessages = downloadResult.errors.map((e) => `${e.name}: ${e.error}`).join('; ')
-      throw new Error(`Download failed: ${errorMessages}`)
-    }
-
-    // Stream files from sandbox to R2
+    // Upload generated files to R2
     const uploadedFiles: Array<{ name: string; size: number; key: string }> = []
 
-    for (const file of downloadResult.results) {
-      console.log(`Streaming ${file.name} to R2...`)
+    for (const table of config.tables) {
+      const filename = `${table}.jsonl`
+      const content = (data as unknown as Record<string, string>)[table]
 
-      // Stream file from sandbox to R2
-      const fileResponse = await sandbox.readFileStream(sandboxId, file.path)
-
-      if (!fileResponse.body) {
-        throw new Error(`Failed to get stream for ${file.name}`)
+      if (!content) {
+        console.warn(`Warning: No data generated for table ${table}`)
+        continue
       }
 
-      // Determine content type
-      const contentType = file.name.endsWith('.parquet')
-        ? 'application/octet-stream'
-        : file.name.endsWith('.tsv')
-        ? 'text/tab-separated-values'
-        : 'application/octet-stream'
+      console.log(`Uploading ${filename}...`)
 
       // Upload to R2
-      const r2Key = `analytics/${dataset}/${file.name}`
-      await c.env.ANALYTICS_BUCKET.put(r2Key, fileResponse.body, {
+      const r2Key = `analytics/${dataset}/${size}/${filename}`
+      await c.env.ANALYTICS_BUCKET.put(r2Key, content, {
         httpMetadata: {
-          contentType,
+          contentType: 'application/x-ndjson',
         },
         customMetadata: {
           dataset,
-          originalName: file.originalName,
-          stagedAt: new Date().toISOString(),
-          sourceUrl: config.files.find((f) =>
-            f.name === file.originalName || f.name.replace('.gz', '') === file.name
-          )?.url ?? '',
+          size,
+          table,
+          generatedAt: new Date().toISOString(),
         },
       })
 
-      // Verify upload
-      const uploaded = await c.env.ANALYTICS_BUCKET.head(r2Key)
-      const uploadedSize = uploaded?.size ?? file.size
-
+      const fileSize = new Blob([content]).size
       uploadedFiles.push({
-        name: file.name,
-        size: uploadedSize,
+        name: filename,
+        size: fileSize,
         key: r2Key,
       })
 
-      console.log(`Uploaded ${file.name}: ${formatBytes(uploadedSize)}`)
+      console.log(`Uploaded ${filename}: ${formatBytes(fileSize)}`)
     }
 
     const totalSize = uploadedFiles.reduce((sum, f) => sum + f.size, 0)
@@ -556,6 +670,7 @@ app.post('/stage/:dataset', async (c) => {
     const response: StageResult = {
       success: true,
       dataset,
+      size,
       duration: Date.now() - startTime,
       files: uploadedFiles,
       totalSize,
@@ -563,50 +678,56 @@ app.post('/stage/:dataset', async (c) => {
 
     return c.json(response)
   } catch (error) {
-    console.error(`Error staging ${dataset}:`, error)
+    console.error(`Error staging ${dataset}/${size}:`, error)
     return c.json(
       {
         success: false,
         dataset,
+        size,
         duration: Date.now() - startTime,
         files: [],
         totalSize: 0,
         error: error instanceof Error ? error.message : String(error),
-        sandboxLogs: sandboxLogs.slice(-5000), // Last 5KB of logs for debugging
       } as StageResult,
       500
     )
-  } finally {
-    // Cleanup: delete sandbox
-    if (sandboxId) {
-      try {
-        await sandbox.delete(sandboxId)
-        console.log(`Sandbox ${sandboxId} deleted`)
-      } catch (e) {
-        console.error(`Failed to delete sandbox ${sandboxId}:`, e)
-      }
-    }
   }
 })
 
+// Legacy endpoint without size (defaults to 10mb)
+app.post('/stage/:dataset', async (c) => {
+  const dataset = c.req.param('dataset')
+  // Redirect to the sized version with default size
+  const url = new URL(c.req.url)
+  url.pathname = `/stage/${dataset}/10mb`
+  return c.redirect(url.toString(), 307)
+})
+
 // Check dataset status
-app.get('/status/:dataset', async (c) => {
+app.get('/status/:dataset/:size', async (c) => {
   const dataset = c.req.param('dataset') as DatasetType
+  const size = c.req.param('size') as SizeOption
 
   // Validate dataset
   if (!DATASET_CONFIGS[dataset]) {
     return c.json({ error: `Invalid dataset: ${dataset}` }, 400)
   }
 
+  // Validate size
+  if (!VALID_SIZES.includes(size)) {
+    return c.json({ error: `Invalid size: ${size}` }, 400)
+  }
+
   const config = DATASET_CONFIGS[dataset]
-  const prefix = `analytics/${dataset}/`
+  const prefix = `analytics/${dataset}/${size}/`
   const files = await c.env.ANALYTICS_BUCKET.list({ prefix })
 
   if (files.objects.length === 0) {
     return c.json({
       exists: false,
       dataset,
-      expectedFiles: config.files.map((f) => f.name),
+      size,
+      expectedTables: config.tables,
       files: [],
     })
   }
@@ -622,24 +743,39 @@ app.get('/status/:dataset', async (c) => {
 
   return c.json({
     exists: true,
-    complete: files.objects.length >= config.files.length,
+    complete: files.objects.length >= config.tables.length,
     dataset,
+    size,
     files: fileList,
     totalSize,
     totalSizeFormatted: formatBytes(totalSize),
   })
 })
 
+// Legacy status endpoint without size
+app.get('/status/:dataset', async (c) => {
+  const dataset = c.req.param('dataset')
+  const url = new URL(c.req.url)
+  url.pathname = `/status/${dataset}/10mb`
+  return c.redirect(url.toString(), 307)
+})
+
 // Delete a staged dataset
-app.delete('/stage/:dataset', async (c) => {
+app.delete('/stage/:dataset/:size', async (c) => {
   const dataset = c.req.param('dataset') as DatasetType
+  const size = c.req.param('size') as SizeOption
 
   // Validate dataset
   if (!DATASET_CONFIGS[dataset]) {
     return c.json({ error: `Invalid dataset: ${dataset}` }, 400)
   }
 
-  const prefix = `analytics/${dataset}/`
+  // Validate size
+  if (!VALID_SIZES.includes(size)) {
+    return c.json({ error: `Invalid size: ${size}` }, 400)
+  }
+
+  const prefix = `analytics/${dataset}/${size}/`
   const files = await c.env.ANALYTICS_BUCKET.list({ prefix })
 
   let deleted = 0
@@ -651,19 +787,26 @@ app.delete('/stage/:dataset', async (c) => {
   return c.json({
     success: true,
     dataset,
+    size,
     deleted,
   })
 })
 
-// Stage all datasets
-app.post('/stage-all', async (c) => {
+// Stage all datasets of a specific size
+app.post('/stage-all/:size', async (c) => {
+  const size = c.req.param('size') as SizeOption
+
+  if (!VALID_SIZES.includes(size)) {
+    return c.json({ error: `Invalid size: ${size}` }, 400)
+  }
+
   const results: StageResult[] = []
   const datasets: DatasetType[] = ['clickbench', 'imdb']
 
   for (const dataset of datasets) {
     // Make internal request to stage endpoint
     const response = await app.fetch(
-      new Request(`http://localhost/stage/${dataset}`, {
+      new Request(`http://localhost/stage/${dataset}/${size}`, {
         method: 'POST',
       }),
       c.env
@@ -678,6 +821,7 @@ app.post('/stage-all', async (c) => {
 
   return c.json({
     summary: {
+      size,
       successful,
       failed,
       total: datasets.length,
@@ -688,13 +832,11 @@ app.post('/stage-all', async (c) => {
   })
 })
 
-// Utility function for formatting bytes
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
-}
+// Legacy stage-all endpoint
+app.post('/stage-all', async (c) => {
+  const url = new URL(c.req.url)
+  url.pathname = '/stage-all/10mb'
+  return c.redirect(url.toString(), 307)
+})
 
 export default app

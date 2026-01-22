@@ -184,7 +184,10 @@ export class TigerBeetleBenchDO extends DurableObject<Env> {
       try {
         const state = JSON.parse(savedState)
         this.ledger.importState(state)
-        this.accountIds = state.accounts.map((a: Account) => a.id)
+        // Safely extract account IDs, handling case where accounts may be undefined
+        if (state.accounts && Array.isArray(state.accounts)) {
+          this.accountIds = state.accounts.map((a: Account) => a.id)
+        }
         this.initialized = true
         return
       } catch {
@@ -238,11 +241,17 @@ export class TigerBeetleBenchDO extends DurableObject<Env> {
   }
 
   /**
+   * BigInt-safe JSON serializer
+   */
+  private bigIntReplacer = (_key: string, value: unknown) =>
+    typeof value === 'bigint' ? value.toString() : value
+
+  /**
    * Save ledger state to durable storage
    */
   private async saveState(): Promise<void> {
     const state = this.ledger.exportState()
-    await this.ctx.storage.put('ledger_state', JSON.stringify(state))
+    await this.ctx.storage.put('ledger_state', JSON.stringify(state, this.bigIntReplacer))
   }
 
   /**
@@ -517,16 +526,20 @@ export class TigerBeetleBenchDO extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
 
+    // BigInt-safe JSON serializer
+    const bigIntReplacer = (_key: string, value: unknown) =>
+      typeof value === 'bigint' ? value.toString() : value
+
     if (request.method === 'POST' && url.pathname === '/run') {
       try {
         const body = (await request.json()) as BenchmarkRequest
         const results = await this.runBenchmarks(body)
-        return new Response(JSON.stringify(results, null, 2), {
+        return new Response(JSON.stringify(results, bigIntReplacer, 2), {
           headers: { 'Content-Type': 'application/json' },
         })
       } catch (error) {
         return new Response(
-          JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' }),
+          JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' }, bigIntReplacer),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
         )
       }
@@ -541,7 +554,7 @@ export class TigerBeetleBenchDO extends DurableObject<Env> {
 
     if (request.method === 'GET' && url.pathname === '/stats') {
       await this.initialize()
-      return new Response(JSON.stringify(this.getStats()), {
+      return new Response(JSON.stringify(this.getStats(), bigIntReplacer), {
         headers: { 'Content-Type': 'application/json' },
       })
     }
@@ -588,7 +601,19 @@ export default {
         })
 
         const response = await benchDO.fetch(doRequest)
+
+        // Check if DO returned an error response
+        if (!response.ok) {
+          const errorBody = await response.json() as { error?: string }
+          throw new Error(errorBody.error ?? `DO request failed with status ${response.status}`)
+        }
+
         const results = (await response.json()) as FinancialBenchmarkResults
+
+        // Validate that benchmarks array exists
+        if (!results.benchmarks || !Array.isArray(results.benchmarks)) {
+          throw new Error('Invalid benchmark results: missing benchmarks array')
+        }
 
         // Add colo information
         const colo = request.cf?.colo as string | undefined
@@ -626,7 +651,11 @@ export default {
         const resultsKey = `financial/${results.runId}.jsonl`
         await env.RESULTS.put(resultsKey, jsonlResults.join('\n'))
 
-        return new Response(JSON.stringify(results, null, 2), {
+        // BigInt-safe JSON serializer
+        const bigIntReplacer = (_key: string, value: unknown) =>
+          typeof value === 'bigint' ? value.toString() : value
+
+        return new Response(JSON.stringify(results, bigIntReplacer, 2), {
           headers: {
             'Content-Type': 'application/json',
             'X-Results-Key': resultsKey,
@@ -634,11 +663,15 @@ export default {
           },
         })
       } catch (error) {
+        // BigInt-safe JSON serializer for error responses
+        const bigIntReplacer = (_key: string, value: unknown) =>
+          typeof value === 'bigint' ? value.toString() : value
+
         return new Response(
           JSON.stringify({
             error: error instanceof Error ? error.message : 'Unknown error',
             stack: error instanceof Error ? error.stack : undefined,
-          }),
+          }, bigIntReplacer),
           { status: 500, headers: { 'Content-Type': 'application/json' } }
         )
       }

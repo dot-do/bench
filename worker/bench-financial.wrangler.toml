@@ -9,6 +9,7 @@
 # Deploy: wrangler deploy -c worker/bench-financial.wrangler.toml
 
 name = "bench-financial"
+account_id = "b6641681fe423910342b9ffa1364c76d"
 main = "bench-financial.ts"
 compatibility_date = "2025-01-21"
 compatibility_flags = ["nodejs_compat"]

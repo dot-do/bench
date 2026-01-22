@@ -20,6 +20,7 @@
 #   curl -X POST "https://bench-mongodb.your-subdomain.workers.dev/benchmark/mongodb?implementation=all&dataset=ecommerce&size=100mb"
 
 name = "bench-mongodb"
+account_id = "b6641681fe423910342b9ffa1364c76d"
 main = "bench-mongodb.ts"
 compatibility_date = "2025-01-21"
 compatibility_flags = ["nodejs_compat"]

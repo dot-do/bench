@@ -21,16 +21,16 @@ compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Workers settings
-account_id = "${CLOUDFLARE_ACCOUNT_ID}"  # Set via environment or replace directly
+account_id = "b6641681fe423910342b9ffa1364c76d"
 
 # Build settings
 [build]
-command = "npx esbuild stage-analytics.ts --bundle --outfile=dist/stage-analytics.js --format=esm --platform=browser"
+command = "npx esbuild worker/stage-analytics.ts --bundle --outfile=dist/stage-analytics.js --format=esm --platform=browser"
 
 # Performance settings for large file download and streaming
 # ClickBench is ~14GB and requires significant time to download
 [limits]
-cpu_ms = 1800000  # 30 minutes max CPU time for ClickBench (~14GB download)
+cpu_ms = 300000  # 5 minutes max CPU time (Cloudflare limit)
 
 # Observability
 [observability]
