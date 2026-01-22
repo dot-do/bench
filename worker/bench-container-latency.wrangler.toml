@@ -12,6 +12,22 @@ main = "bench-container-latency.ts"
 compatibility_date = "2025-01-21"
 compatibility_flags = ["nodejs_compat"]
 
+# ==============================================================================
+# WASM Module Rules
+# ==============================================================================
+# These rules enable static import of WASM modules and data files.
+# PGLite requires pre-compiled WASM for Cloudflare Workers compatibility.
+# Without these rules, PGLite fails with "Invalid URL string" error.
+# ==============================================================================
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+
+[[rules]]
+type = "Data"
+globs = ["**/*.data"]
+
 # Enable logpush for benchmark analysis
 logpush = true
 

@@ -1,5 +1,17 @@
 // Type declarations for optional/external modules
 
+// WASM and Data file imports for Cloudflare Workers
+// These are bundled at build time via wrangler rules
+declare module '*.wasm' {
+  const wasmModule: WebAssembly.Module
+  export default wasmModule
+}
+
+declare module '*.data' {
+  const data: ArrayBuffer
+  export default data
+}
+
 // Cloudflare Workers modules
 declare module 'cloudflare:workers' {
   export class DurableObject {
@@ -102,9 +114,19 @@ declare module '@dotdo/postgres' {
 }
 
 declare module '@electric-sql/pglite' {
+  export interface PGliteOptions {
+    dataDir?: string
+    wasmModule?: WebAssembly.Module
+    fsBundle?: Blob
+    database?: string
+    debug?: number
+  }
+
   export class PGlite {
+    static create(options?: PGliteOptions): Promise<PGlite>
+    constructor(dataDir?: string)
     waitReady: Promise<void>
-    query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[]; fields: { name: string }[]; rowCount?: number }>
+    query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[]; fields?: { name: string; dataTypeID: number }[]; affectedRows?: number }>
     transaction<T>(fn: (tx: PGlite) => Promise<T>): Promise<T>
     close(): Promise<void>
   }

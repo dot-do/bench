@@ -39,6 +39,11 @@ import type { PostgresStore } from '../databases/postgres.js'
 import type { SQLiteStore } from '../databases/sqlite.js'
 import type { DuckDBStore } from '../databases/duckdb.js'
 
+// Import PGLite WASM assets for Cloudflare Workers compatibility
+// These are pre-compiled at bundle time via wrangler rules
+import pgliteWasm from './pglite-assets/pglite.wasm'
+import pgliteData from './pglite-assets/pglite.data'
+
 // Environment bindings
 interface Env {
   // Container Durable Object namespaces for container management
@@ -705,6 +710,9 @@ async function benchmarkContainer(
 
 /**
  * Create WASM database store
+ *
+ * For Cloudflare Workers, we use createPostgresStoreWithAssets() with
+ * pre-compiled WASM module and fsBundle to avoid URL resolution errors.
  */
 async function createWasmStore(database: DatabaseType): Promise<{
   store: PostgresStore | SQLiteStore | DuckDBStore | null
@@ -712,8 +720,15 @@ async function createWasmStore(database: DatabaseType): Promise<{
 }> {
   switch (database) {
     case 'postgres': {
-      const { createPostgresStore } = await import('../databases/postgres.js')
-      return { store: await createPostgresStore(), type: 'sql' }
+      // Use Workers-compatible API with pre-compiled WASM assets
+      const { createPostgresStoreWithAssets } = await import('../databases/postgres.js')
+      return {
+        store: await createPostgresStoreWithAssets({
+          wasmModule: pgliteWasm,
+          fsBundle: pgliteData,
+        }),
+        type: 'sql',
+      }
     }
     case 'sqlite': {
       const { createSQLiteStore } = await import('../databases/sqlite.js')
