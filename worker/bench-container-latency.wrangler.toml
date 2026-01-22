@@ -82,40 +82,44 @@ new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO
 # based simulated mode for benchmarking.
 # ==============================================================================
 
-# PostgreSQL Container
-# Runs PostgreSQL with an HTTP REST API bridge
-[[containers]]
-class_name = "PostgresContainerDO"
-image = "../containers/dockerfiles/Dockerfile.postgres"
-max_instances = 10
-
-# ClickHouse Container
-# ClickHouse has native HTTP interface on port 8123
-[[containers]]
-class_name = "ClickHouseContainerDO"
-image = "../containers/dockerfiles/Dockerfile.clickhouse"
-max_instances = 10
-
-# MongoDB Container
-# Runs MongoDB with an HTTP REST API bridge
-[[containers]]
-class_name = "MongoContainerDO"
-image = "../containers/dockerfiles/Dockerfile.mongo"
-max_instances = 10
-
-# DuckDB Container
-# DuckDB with HTTP REST API for analytical queries
-[[containers]]
-class_name = "DuckDBContainerDO"
-image = "../containers/dockerfiles/Dockerfile.duckdb"
-max_instances = 10
-
-# SQLite Container
-# SQLite with HTTP REST API bridge
-[[containers]]
-class_name = "SQLiteContainerDO"
-image = "../containers/dockerfiles/Dockerfile.sqlite"
-max_instances = 10
+# ==============================================================================
+# Container Bindings (Placeholder)
+# ==============================================================================
+# NOTE: Cloudflare Containers syntax may differ when officially released.
+# These bindings are placeholders. The Durable Object classes above provide
+# simulated container behavior for benchmarking until real containers are available.
+#
+# When Cloudflare Containers become available, uncomment and update these:
+#
+# [[containers]]
+# binding = "POSTGRES_CONTAINER"
+# class_name = "PostgresContainerDO"
+# image = "../containers/dockerfiles/Dockerfile.postgres"
+# max_instances = 10
+#
+# [[containers]]
+# binding = "CLICKHOUSE_CONTAINER"
+# class_name = "ClickHouseContainerDO"
+# image = "../containers/dockerfiles/Dockerfile.clickhouse"
+# max_instances = 10
+#
+# [[containers]]
+# binding = "MONGO_CONTAINER"
+# class_name = "MongoContainerDO"
+# image = "../containers/dockerfiles/Dockerfile.mongo"
+# max_instances = 10
+#
+# [[containers]]
+# binding = "DUCKDB_CONTAINER"
+# class_name = "DuckDBContainerDO"
+# image = "../containers/dockerfiles/Dockerfile.duckdb"
+# max_instances = 10
+#
+# [[containers]]
+# binding = "SQLITE_CONTAINER"
+# class_name = "SQLiteContainerDO"
+# image = "../containers/dockerfiles/Dockerfile.sqlite"
+# max_instances = 10
 
 # ==============================================================================
 # Environment-specific configurations
@@ -153,16 +157,7 @@ invocation_logs = true
 # Build configuration
 # ==============================================================================
 
-[build]
-command = ""
-
-[build.upload]
-format = "modules"
-main = "./bench-container-latency.ts"
-
-[[build.upload.rules]]
-type = "ESModule"
-globs = ["**/*.ts"]
+# Build is handled by wrangler automatically
 
 # ==============================================================================
 # Placement (optional - for specific region targeting)

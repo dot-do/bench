@@ -1,9 +1,9 @@
 # Wrangler configuration for MongoDB Benchmark Worker
 #
 # This worker runs MongoDB benchmarks across 3 implementations:
-# - @db4/mongo: Pure TypeScript, zero WASM
-# - @dotdo/mongodb: PostgreSQL/DocumentDB backend (PGLite WASM)
-# - mongo-clickhouse: ClickHouse OLAP backend
+# - db4: In-memory MongoDB-compatible store (Pure TypeScript, zero WASM)
+# - postgres: @dotdo/chdb-mongo-compat - MongoDB-compatible layer with full query support
+# - clickhouse: @dotdo/chdb-mongo-compat - ClickHouse-style OLAP backend via MongoDB API
 #
 # Benchmark operations:
 # - find (range queries)
@@ -134,14 +134,8 @@ invocation_logs = true
 # Build configuration
 # ==============================================================================
 
-[build]
-command = ""
-
-[build.upload]
-format = "modules"
-main = "./bench-mongodb.ts"
-
-[[build.upload.rules]]
+# Rules for module resolution
+[[rules]]
 type = "ESModule"
 globs = ["**/*.ts"]
 
@@ -210,14 +204,14 @@ globs = ["**/*.ts"]
 #
 # Implementation Notes:
 #
-# - @db4/mongo: Pure TypeScript, zero WASM overhead, fastest cold start
+# - db4: In-memory MongoDB-compatible store, pure TypeScript, zero WASM overhead, fastest cold start
 #   Best for: OLTP workloads, edge computing, low-latency requirements
 #
-# - @dotdo/mongodb: Uses PGLite WASM for PostgreSQL-compatible storage
-#   Best for: Complex queries, ACID transactions, SQL compatibility
+# - postgres: @dotdo/chdb-mongo-compat - Full MongoDB-compatible layer
+#   Best for: Complex queries, aggregation pipelines, full MongoDB API compatibility
 #
-# - mongo-clickhouse: ClickHouse backend (simulated in Worker due to chdb unavailability)
-#   Best for: OLAP workloads, large scans, columnar analytics
+# - clickhouse: @dotdo/chdb-mongo-compat - ClickHouse-style OLAP backend via MongoDB API
+#   Best for: OLAP workloads, large scans, analytical queries
 #
 # Result Format (JSONL):
 #

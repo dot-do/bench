@@ -52,10 +52,27 @@ let duckdbConnection: unknown = null
 /**
  * Create a new DuckDB store instance.
  * Lazy-loads DuckDB WASM on first instantiation.
+ *
+ * NOTE: Requires @duckdb/duckdb-wasm to be installed.
+ * This adapter is a placeholder for WASM database benchmarks.
  */
 export async function createDuckDBStore(): Promise<DuckDBStore> {
   // Lazy import DuckDB WASM - this is the expensive operation
-  const duckdb = await import('@dotdo/duckdb')
+  // Try @duckdb/duckdb-wasm (the real package) first, fall back to error
+  let duckdb: {
+    selectBundle: (bundles: unknown) => Promise<{ mainModule: string; mainWorker: string }>
+    DUCKDB_BUNDLES: { mvp: { mainModule: string; mainWorker: string }; eh: { mainModule: string; mainWorker: string } }
+    ConsoleLogger: new () => unknown
+    AsyncDuckDB: new (logger: unknown, worker: Worker) => unknown
+  }
+  try {
+    duckdb = await import('@duckdb/duckdb-wasm')
+  } catch {
+    throw new Error(
+      'DuckDB WASM adapter requires @duckdb/duckdb-wasm package. ' +
+        'Install with: pnpm add @duckdb/duckdb-wasm'
+    )
+  }
 
   // Reuse WASM instance if available (for warm benchmarks)
   if (!duckdbInstance) {

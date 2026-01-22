@@ -19,3 +19,6 @@
 [submodule "packages/pocs"]
 	path = packages/pocs
 	url = https://github.com/dot-do/pocs.git
+[submodule "packages/clickhouse"]
+	path = packages/clickhouse
+	url = https://github.com/dot-do/clickhouse.git

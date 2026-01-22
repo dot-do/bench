@@ -148,8 +148,8 @@ interface OLTPBenchmarkResults {
   }
 }
 
-// Generic document type for benchmarks
-interface Document {
+// Generic document type for benchmarks (named BenchDoc to avoid conflict with @db4/client Document)
+interface BenchDoc {
   id?: string
   _id?: string
   $id?: string
@@ -206,7 +206,7 @@ function calculateStats(times: number[]): {
 }
 
 // Parse JSONL content into array of documents
-function parseJSONL(content: string): Document[] {
+function parseJSONL(content: string): BenchDoc[] {
   return content
     .trim()
     .split('\n')
@@ -224,16 +224,16 @@ interface DatabaseAdapter {
   close(): Promise<void>
 
   // OLTP operations
-  pointLookup(collection: string, id: string): Promise<Document | null>
-  rangeScan(collection: string, filter: Record<string, unknown>, limit?: number): Promise<Document[]>
-  insert(collection: string, doc: Document): Promise<void>
-  batchInsert(collection: string, docs: Document[]): Promise<void>
+  pointLookup(collection: string, id: string): Promise<BenchDoc | null>
+  rangeScan(collection: string, filter: Record<string, unknown>, limit?: number): Promise<BenchDoc[]>
+  insert(collection: string, doc: BenchDoc): Promise<void>
+  batchInsert(collection: string, docs: BenchDoc[]): Promise<void>
   update(collection: string, id: string, updates: Record<string, unknown>): Promise<void>
   delete(collection: string, id: string): Promise<boolean>
   transaction(fn: () => Promise<void>): Promise<void>
 
   // Data loading
-  loadData(collection: string, docs: Document[]): Promise<number>
+  loadData(collection: string, docs: BenchDoc[]): Promise<number>
   getCollectionIds(collection: string): Promise<string[]>
 }
 
@@ -244,65 +244,74 @@ interface DatabaseAdapter {
 /**
  * DB4 Adapter - Pure TypeScript document store
  * Uses @db4/client for the client SDK
+ *
+ * @db4/client provides an in-memory implementation when created with a baseUrl.
+ * The client stores data in a module-level Map for testing purposes.
  */
 class DB4Adapter implements DatabaseAdapter {
   name: DatabaseType = 'db4'
-  private client: Awaited<ReturnType<typeof import('@db4/client').createClient>> | null = null
-  private collections: Map<string, ReturnType<typeof this.client.collection>> = new Map()
+  private client: import('@db4/client').DB4Client | null = null
+  // Use any here because @db4/client's Document type requires id: string (not optional)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private collections: Map<string, any> = new Map()
 
   async connect(): Promise<void> {
     const { createClient } = await import('@db4/client')
-    // Create in-memory client for benchmarking
-    this.client = createClient({ mode: 'memory' })
+    // Create client - the @db4/client uses an in-memory store by default for testing
+    // The baseUrl is required but the client stores data in-memory for testing
+    this.client = createClient({ baseUrl: 'http://localhost:0' })
   }
 
   async close(): Promise<void> {
     this.collections.clear()
+    await this.client?.close()
     this.client = null
   }
 
   private getCollection(name: string) {
+    if (!this.client) throw new Error('Client not connected')
     if (!this.collections.has(name)) {
-      this.collections.set(name, this.client!.collection(name))
+      // Use any type to avoid @db4/core Document constraint (requires id: string)
+      this.collections.set(name, this.client.collection(name))
     }
     return this.collections.get(name)!
   }
 
-  private normalizeId(doc: Document): string {
+  private normalizeId(doc: BenchDoc): string {
     return (doc.id ?? doc._id ?? doc.$id ?? '') as string
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
+  async pointLookup(collection: string, id: string): Promise<BenchDoc | null> {
     const col = this.getCollection(collection)
-    const result = await col.findOne({ id })
-    return result as Document | null
+    const result = await col.get(id)
+    return result as BenchDoc | null
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
+  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<BenchDoc[]> {
     const col = this.getCollection(collection)
-    const results = await col.find(filter, { limit })
-    return results as Document[]
+    const results = await col.findMany({ filter, limit })
+    return results.documents as BenchDoc[]
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
+  async insert(collection: string, doc: BenchDoc): Promise<void> {
     const col = this.getCollection(collection)
     await col.create(doc)
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
+  async batchInsert(collection: string, docs: BenchDoc[]): Promise<void> {
     const col = this.getCollection(collection)
     await col.createMany(docs)
   }
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const col = this.getCollection(collection)
-    await col.update({ id }, updates)
+    await col.update(id, updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
     const col = this.getCollection(collection)
-    const result = await col.delete({ id })
-    return result.deleted > 0
+    const result = await col.delete(id)
+    return result.deleted
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
@@ -310,401 +319,258 @@ class DB4Adapter implements DatabaseAdapter {
     await fn()
   }
 
-  async loadData(collection: string, docs: Document[]): Promise<number> {
+  async loadData(collection: string, docs: BenchDoc[]): Promise<number> {
     await this.batchInsert(collection, docs)
     return docs.length
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
     const col = this.getCollection(collection)
-    const docs = await col.find({}, { limit: 10000, projection: { id: 1 } })
-    return docs.map((d: Document) => d.id ?? '') as string[]
+    const results = await col.findMany({ limit: 10000, projection: ['id'] })
+    return results.documents.map((d: BenchDoc) => d.id ?? '') as string[]
   }
 }
 
+// TODO: EvoDB Adapter - @evodb/core package is not linked to the workspace
+// The EvoDB implementation exists in packages/evodb/core but is not published
+// or linked to the workspace's node_modules. The npm package 'evodb' is a
+// different, unrelated project.
+// Commenting out until @evodb/core is properly linked.
+//
+// class EvoDBAdapter implements DatabaseAdapter {
+//   name: DatabaseType = 'evodb'
+//   // Implementation would use: new EvoDB({ mode: 'development' })
+// }
+
 /**
- * EvoDB Adapter - Event-sourced columnar document store
- * Uses evodb package for columnar JSON storage
+ * Placeholder EvoDBAdapter - not implemented
+ * TODO: Implement when @evodb/core is properly linked to the workspace
  */
 class EvoDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'evodb'
-  private db: InstanceType<typeof import('evodb').EvoDB> | null = null
 
   async connect(): Promise<void> {
-    const { EvoDB } = await import('evodb')
-    // Create in-memory EvoDB instance for benchmarking
-    this.db = new EvoDB({ storage: null }) // null storage = in-memory
+    throw new Error('@evodb/core is not linked to this workspace. TODO: Add workspace link to packages/evodb/core.')
   }
 
-  async close(): Promise<void> {
-    this.db = null
+  async close(): Promise<void> {}
+
+  async pointLookup(_collection: string, _id: string): Promise<BenchDoc | null> {
+    throw new Error('Not implemented')
   }
 
-  private normalizeId(doc: Document): string {
-    return (doc.id ?? doc._id ?? doc.$id ?? '') as string
+  async rangeScan(_collection: string, _filter: Record<string, unknown>, _limit?: number): Promise<BenchDoc[]> {
+    throw new Error('Not implemented')
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const results = await this.db!.query(collection).where('id', '=', id).limit(1).execute()
-    return (results.data[0] as Document) ?? null
+  async insert(_collection: string, _doc: BenchDoc): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    let query = this.db!.query(collection)
-    for (const [key, value] of Object.entries(filter)) {
-      query = query.where(key, '=', value)
-    }
-    const results = await query.limit(limit).execute()
-    return results.data as Document[]
+  async batchInsert(_collection: string, _docs: BenchDoc[]): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
-    await this.db!.insert(collection, [doc])
+  async update(_collection: string, _id: string, _updates: Record<string, unknown>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    await this.db!.insert(collection, docs)
+  async delete(_collection: string, _id: string): Promise<boolean> {
+    throw new Error('Not implemented')
   }
 
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    await this.db!.update(collection, { id }, updates)
+  async transaction(_fn: () => Promise<void>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.db!.delete(collection, { id })
-    return result.deleted > 0
+  async loadData(_collection: string, _docs: BenchDoc[]): Promise<number> {
+    throw new Error('Not implemented')
   }
 
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    // EvoDB is event-sourced, execute atomically
-    await fn()
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const results = await this.db!.query(collection).select(['id']).limit(10000).execute()
-    return results.data.map((d: Record<string, unknown>) => (d.id ?? '') as string)
+  async getCollectionIds(_collection: string): Promise<string[]> {
+    throw new Error('Not implemented')
   }
 }
 
+// TODO: PostgreSQL Adapter - requires a running PostgresDO instance
+// The @dotdo/sqlite client requires a WebSocket URL to connect to a Durable Object.
+// For in-memory benchmarking, we would need to run this inside a DO context.
+// Commenting out until we have a proper PostgresDO endpoint for benchmarking.
+//
+// class PostgresAdapter implements DatabaseAdapter {
+//   name: DatabaseType = 'postgres'
+//   // Implementation would use @dotdo/sqlite createClient({ url: 'wss://...' })
+// }
+
 /**
- * PostgreSQL Adapter - Uses @dotdo/sqlite client (Turso-compatible)
- * Note: For OLTP benchmarks in Workers, we use the SQLite client
- * which provides PostgreSQL-like API via Hrana protocol
+ * Placeholder PostgresAdapter - not implemented
+ * TODO: Implement when PostgresDO endpoint is available for benchmarking
  */
 class PostgresAdapter implements DatabaseAdapter {
   name: DatabaseType = 'postgres'
-  private client: Awaited<ReturnType<typeof import('@dotdo/sqlite').createClient>> | null = null
-  private tableSchemas: Map<string, string> = new Map()
 
   async connect(): Promise<void> {
-    const { createClient } = await import('@dotdo/sqlite')
-    // Create in-memory SQLite client for benchmarking
-    // In production, this would connect to a real PostgresDO
-    this.client = createClient({ url: ':memory:' })
+    throw new Error('PostgreSQL adapter requires a running PostgresDO instance. TODO: Implement when endpoint is available.')
   }
 
-  async close(): Promise<void> {
-    this.client?.close()
-    this.client = null
+  async close(): Promise<void> {}
+
+  async pointLookup(_collection: string, _id: string): Promise<BenchDoc | null> {
+    throw new Error('Not implemented')
   }
 
-  private normalizeId(doc: Document): string {
-    return (doc.id ?? doc._id ?? doc.$id ?? '') as string
+  async rangeScan(_collection: string, _filter: Record<string, unknown>, _limit?: number): Promise<BenchDoc[]> {
+    throw new Error('Not implemented')
   }
 
-  private async ensureTable(collection: string): Promise<void> {
-    if (this.tableSchemas.has(collection)) return
-
-    // Create a simple JSON-based table
-    await this.client!.execute(`
-      CREATE TABLE IF NOT EXISTS ${collection} (
-        id TEXT PRIMARY KEY,
-        data TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
-      )
-    `)
-    this.tableSchemas.set(collection, 'created')
+  async insert(_collection: string, _doc: BenchDoc): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.client!.execute({
-      sql: `SELECT data FROM ${collection} WHERE id = ?`,
-      args: [id]
-    })
-    if (result.rows.length === 0) return null
-    return JSON.parse(result.rows[0].data as string)
+  async batchInsert(_collection: string, _docs: BenchDoc[]): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    // Use JSON extraction for filtering
-    const conditions: string[] = []
-    const params: (string | number)[] = []
-
-    for (const [key, value] of Object.entries(filter)) {
-      conditions.push(`json_extract(data, '$.${key}') = ?`)
-      params.push(String(value))
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const result = await this.client!.execute({
-      sql: `SELECT data FROM ${collection} ${whereClause} LIMIT ?`,
-      args: [...params, limit]
-    })
-    return result.rows.map((r) => JSON.parse(r.data as string))
+  async update(_collection: string, _id: string, _updates: Record<string, unknown>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
-    await this.ensureTable(collection)
-    const id = this.normalizeId(doc)
-    await this.client!.execute({
-      sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-      args: [id, JSON.stringify(doc)]
-    })
+  async delete(_collection: string, _id: string): Promise<boolean> {
+    throw new Error('Not implemented')
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    if (docs.length === 0) return
-    await this.ensureTable(collection)
-
-    const statements = docs.map((doc) => {
-      const id = this.normalizeId(doc)
-      return {
-        sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-        args: [id, JSON.stringify(doc)]
-      }
-    })
-    await this.client!.batch(statements)
+  async transaction(_fn: () => Promise<void>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const existing = await this.pointLookup(collection, id)
-    if (existing) {
-      const updated = { ...existing, ...updates }
-      await this.client!.execute({
-        sql: `UPDATE ${collection} SET data = ? WHERE id = ?`,
-        args: [JSON.stringify(updated), id]
-      })
-    }
+  async loadData(_collection: string, _docs: BenchDoc[]): Promise<number> {
+    throw new Error('Not implemented')
   }
 
-  async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.client!.execute({
-      sql: `DELETE FROM ${collection} WHERE id = ?`,
-      args: [id]
-    })
-    return result.rowsAffected > 0
-  }
-
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    const tx = await this.client!.transaction()
-    try {
-      await fn()
-      await tx.commit()
-    } catch (e) {
-      await tx.rollback()
-      throw e
-    }
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.client!.execute({
-      sql: `SELECT id FROM ${collection} LIMIT 10000`,
-      args: []
-    })
-    return result.rows.map((r) => r.id as string)
+  async getCollectionIds(_collection: string): Promise<string[]> {
+    throw new Error('Not implemented')
   }
 }
 
+// TODO: SQLite Adapter - requires a running SQLiteDO instance
+// The @dotdo/sqlite client requires a WebSocket URL to connect to a Durable Object.
+// For in-memory benchmarking, we could use createMemoryDb() but that's internal.
+// Commenting out until we have a proper SQLiteDO endpoint for benchmarking.
+//
+// class SQLiteAdapter implements DatabaseAdapter {
+//   name: DatabaseType = 'sqlite'
+//   // Implementation would use @dotdo/sqlite createClient({ url: 'wss://...' })
+// }
+
 /**
- * SQLite Adapter - Uses @dotdo/sqlite (Turso WASM SQLite)
+ * Placeholder SQLiteAdapter - not implemented
+ * TODO: Implement when SQLiteDO endpoint is available for benchmarking
  */
 class SQLiteAdapter implements DatabaseAdapter {
   name: DatabaseType = 'sqlite'
-  private client: Awaited<ReturnType<typeof import('@dotdo/sqlite').createClient>> | null = null
-  private tableSchemas: Map<string, string> = new Map()
 
   async connect(): Promise<void> {
-    const { createClient } = await import('@dotdo/sqlite')
-    // Create in-memory SQLite client for benchmarking
-    this.client = createClient({ url: ':memory:' })
+    throw new Error('SQLite adapter requires a running SQLiteDO instance. TODO: Implement when endpoint is available.')
   }
 
-  async close(): Promise<void> {
-    this.client?.close()
-    this.client = null
+  async close(): Promise<void> {}
+
+  async pointLookup(_collection: string, _id: string): Promise<BenchDoc | null> {
+    throw new Error('Not implemented')
   }
 
-  private normalizeId(doc: Document): string {
-    return (doc.id ?? doc._id ?? doc.$id ?? '') as string
+  async rangeScan(_collection: string, _filter: Record<string, unknown>, _limit?: number): Promise<BenchDoc[]> {
+    throw new Error('Not implemented')
   }
 
-  private async ensureTable(collection: string): Promise<void> {
-    if (this.tableSchemas.has(collection)) return
-
-    await this.client!.execute(`
-      CREATE TABLE IF NOT EXISTS ${collection} (
-        id TEXT PRIMARY KEY,
-        data TEXT NOT NULL,
-        created_at TEXT DEFAULT (datetime('now'))
-      )
-    `)
-    this.tableSchemas.set(collection, 'created')
+  async insert(_collection: string, _doc: BenchDoc): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.client!.execute({
-      sql: `SELECT data FROM ${collection} WHERE id = ?`,
-      args: [id]
-    })
-    if (result.rows.length === 0) return null
-    return JSON.parse(result.rows[0].data as string)
+  async batchInsert(_collection: string, _docs: BenchDoc[]): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    // Use json_extract for JSON path queries
-    const conditions: string[] = []
-    const params: (string | number)[] = []
-
-    for (const [key, value] of Object.entries(filter)) {
-      conditions.push(`json_extract(data, '$.${key}') = ?`)
-      params.push(String(value))
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const result = await this.client!.execute({
-      sql: `SELECT data FROM ${collection} ${whereClause} LIMIT ?`,
-      args: [...params, limit]
-    })
-    return result.rows.map((r) => JSON.parse(r.data as string))
+  async update(_collection: string, _id: string, _updates: Record<string, unknown>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
-    await this.ensureTable(collection)
-    const id = this.normalizeId(doc)
-    await this.client!.execute({
-      sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-      args: [id, JSON.stringify(doc)]
-    })
+  async delete(_collection: string, _id: string): Promise<boolean> {
+    throw new Error('Not implemented')
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    if (docs.length === 0) return
-    await this.ensureTable(collection)
-
-    const statements = docs.map((doc) => {
-      const id = this.normalizeId(doc)
-      return {
-        sql: `INSERT OR IGNORE INTO ${collection} (id, data) VALUES (?, ?)`,
-        args: [id, JSON.stringify(doc)]
-      }
-    })
-    await this.client!.batch(statements)
+  async transaction(_fn: () => Promise<void>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    const existing = await this.pointLookup(collection, id)
-    if (existing) {
-      const updated = { ...existing, ...updates }
-      await this.client!.execute({
-        sql: `UPDATE ${collection} SET data = ? WHERE id = ?`,
-        args: [JSON.stringify(updated), id]
-      })
-    }
+  async loadData(_collection: string, _docs: BenchDoc[]): Promise<number> {
+    throw new Error('Not implemented')
   }
 
-  async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.client!.execute({
-      sql: `DELETE FROM ${collection} WHERE id = ?`,
-      args: [id]
-    })
-    return result.rowsAffected > 0
-  }
-
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    const tx = await this.client!.transaction()
-    try {
-      await fn()
-      await tx.commit()
-    } catch (e) {
-      await tx.rollback()
-      throw e
-    }
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.client!.execute({
-      sql: `SELECT id FROM ${collection} LIMIT 10000`,
-      args: []
-    })
-    return result.rows.map((r) => r.id as string)
+  async getCollectionIds(_collection: string): Promise<string[]> {
+    throw new Error('Not implemented')
   }
 }
 
 /**
  * @db4/mongo Adapter - MongoDB API with db4 backend
  * Uses @db4/client with MongoDB-style API compatibility
+ *
+ * This is essentially the same as DB4Adapter but uses _id as the primary key
+ * to match MongoDB conventions.
  */
 class DB4MongoAdapter implements DatabaseAdapter {
   name: DatabaseType = 'db4-mongo'
-  private client: Awaited<ReturnType<typeof import('@db4/client').createClient>> | null = null
-  private collections: Map<string, ReturnType<typeof this.client.collection>> = new Map()
+  private client: import('@db4/client').DB4Client | null = null
+  // Use any here because @db4/client's Document type requires id: string (not optional)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private collections: Map<string, any> = new Map()
 
   async connect(): Promise<void> {
     const { createClient } = await import('@db4/client')
-    // Create in-memory client for benchmarking
-    this.client = createClient({ mode: 'memory' })
+    // Create client - the @db4/client uses an in-memory store by default for testing
+    this.client = createClient({ baseUrl: 'http://localhost:0' })
   }
 
   async close(): Promise<void> {
     this.collections.clear()
+    await this.client?.close()
     this.client = null
   }
 
   private getCollection(name: string) {
+    if (!this.client) throw new Error('Client not connected')
     if (!this.collections.has(name)) {
-      this.collections.set(name, this.client!.collection(name))
+      // Use any type to avoid @db4/core Document constraint (requires id: string)
+      this.collections.set(name, this.client.collection(name))
     }
     return this.collections.get(name)!
   }
 
-  private normalizeId(doc: Document): string {
+  private normalizeId(doc: BenchDoc): string {
     return (doc._id ?? doc.id ?? doc.$id ?? '') as string
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
+  async pointLookup(collection: string, id: string): Promise<BenchDoc | null> {
     const col = this.getCollection(collection)
-    const result = await col.findOne({ _id: id })
-    return result as Document | null
+    // Use findOne with _id filter for MongoDB-style lookup
+    const result = await col.findOne({ _id: id } as Record<string, unknown>)
+    return result as BenchDoc | null
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
+  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<BenchDoc[]> {
     const col = this.getCollection(collection)
-    const results = await col.find(filter, { limit })
-    return results as Document[]
+    const results = await col.findMany({ filter, limit })
+    return results.documents as BenchDoc[]
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
+  async insert(collection: string, doc: BenchDoc): Promise<void> {
     const col = this.getCollection(collection)
     const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
     await col.create(mongoDoc)
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
+  async batchInsert(collection: string, docs: BenchDoc[]): Promise<void> {
     const col = this.getCollection(collection)
     const mongoDocs = docs.map((doc) => ({
       ...doc,
@@ -715,13 +581,14 @@ class DB4MongoAdapter implements DatabaseAdapter {
 
   async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
     const col = this.getCollection(collection)
-    await col.update({ _id: id }, updates)
+    // @db4/client update takes (id, updates) directly
+    await col.update(id, updates)
   }
 
   async delete(collection: string, id: string): Promise<boolean> {
     const col = this.getCollection(collection)
-    const result = await col.delete({ _id: id })
-    return result.deleted > 0
+    const result = await col.delete(id)
+    return result.deleted
   }
 
   async transaction(fn: () => Promise<void>): Promise<void> {
@@ -729,171 +596,136 @@ class DB4MongoAdapter implements DatabaseAdapter {
     await fn()
   }
 
-  async loadData(collection: string, docs: Document[]): Promise<number> {
+  async loadData(collection: string, docs: BenchDoc[]): Promise<number> {
     await this.batchInsert(collection, docs)
     return docs.length
   }
 
   async getCollectionIds(collection: string): Promise<string[]> {
     const col = this.getCollection(collection)
-    const docs = await col.find({}, { limit: 10000, projection: { _id: 1 } })
-    return docs.map((d: Document) => (d._id ?? '') as string)
+    const results = await col.findMany({ limit: 10000, projection: ['_id'] })
+    return results.documents.map((d: BenchDoc) => (d._id ?? d.id ?? '') as string)
   }
 }
 
+// TODO: @dotdo/mongodb Adapter - package does not exist
+// There is no @dotdo/mongodb package in this monorepo.
+// This was a hypothetical MongoDB compatibility layer.
+// Commenting out until the package is implemented.
+//
+// class DotDoMongoDBAdapter implements DatabaseAdapter {
+//   name: DatabaseType = 'dotdo-mongodb'
+//   // Implementation would use @dotdo/mongodb MongoClient
+// }
+
 /**
- * @dotdo/mongodb Adapter - MongoDB compatibility layer
- * Uses @dotdo/mongodb which provides MongoDB-style API
+ * Placeholder DotDoMongoDBAdapter - not implemented
+ * TODO: Implement when @dotdo/mongodb package is available
  */
 class DotDoMongoDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'dotdo-mongodb'
-  private client: InstanceType<typeof import('@dotdo/mongodb').MongoClient> | null = null
-  private db: ReturnType<typeof this.client.db> | null = null
 
   async connect(): Promise<void> {
-    const { MongoClient } = await import('@dotdo/mongodb')
-    // Create in-memory MongoDB-compatible client for benchmarking
-    this.client = new MongoClient('memory://')
-    await this.client.connect()
-    this.db = this.client.db('benchmark')
+    throw new Error('@dotdo/mongodb package does not exist. TODO: Implement when package is available.')
   }
 
-  async close(): Promise<void> {
-    await this.client?.close()
-    this.client = null
-    this.db = null
+  async close(): Promise<void> {}
+
+  async pointLookup(_collection: string, _id: string): Promise<BenchDoc | null> {
+    throw new Error('Not implemented')
   }
 
-  private normalizeId(doc: Document): string {
-    return (doc._id ?? doc.id ?? doc.$id ?? '') as string
+  async rangeScan(_collection: string, _filter: Record<string, unknown>, _limit?: number): Promise<BenchDoc[]> {
+    throw new Error('Not implemented')
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    const result = await this.db!.collection(collection).findOne({ _id: id })
-    return result as Document | null
+  async insert(_collection: string, _doc: BenchDoc): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    const cursor = this.db!.collection(collection).find(filter).limit(limit)
-    return (await cursor.toArray()) as Document[]
+  async batchInsert(_collection: string, _docs: BenchDoc[]): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
-    const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-    delete mongoDoc.id
-    delete mongoDoc.$id
-    await this.db!.collection(collection).insertOne(mongoDoc)
+  async update(_collection: string, _id: string, _updates: Record<string, unknown>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    const mongoDocs = docs.map((doc) => {
-      const mongoDoc = { ...doc, _id: this.normalizeId(doc) }
-      delete mongoDoc.id
-      delete mongoDoc.$id
-      return mongoDoc
-    })
-    await this.db!.collection(collection).insertMany(mongoDocs)
+  async delete(_collection: string, _id: string): Promise<boolean> {
+    throw new Error('Not implemented')
   }
 
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    await this.db!.collection(collection).updateOne({ _id: id }, { $set: updates })
+  async transaction(_fn: () => Promise<void>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async delete(collection: string, id: string): Promise<boolean> {
-    const result = await this.db!.collection(collection).deleteOne({ _id: id })
-    return (result.deletedCount ?? 0) > 0
+  async loadData(_collection: string, _docs: BenchDoc[]): Promise<number> {
+    throw new Error('Not implemented')
   }
 
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    // @dotdo/mongodb supports transactions
-    await fn()
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const docs = await this.db!.collection(collection).find({}).limit(10000).toArray()
-    return docs.map((d: Document) => (d._id ?? '') as string)
+  async getCollectionIds(_collection: string): Promise<string[]> {
+    throw new Error('Not implemented')
   }
 }
 
+// TODO: SDB Adapter - requires a running SDB Durable Object instance
+// The @dotdo/sdb DB() function requires a schema and { url: string } config
+// to connect to a remote SDB server. There's no in-memory mode.
+// Commenting out until we have a proper SDB endpoint for benchmarking.
+//
+// class SDBAdapter implements DatabaseAdapter {
+//   name: DatabaseType = 'sdb'
+//   // Implementation would use:
+//   // const db = DB({ EntityType: { field: 'type', ... } }, { url: 'https://tenant.sdb.do' })
+// }
+
 /**
- * SDB Adapter - Document/graph database
- * Uses @dotdo/sdb for document and graph database operations
+ * Placeholder SDBAdapter - not implemented
+ * TODO: Implement when SDB endpoint is available for benchmarking
  */
 class SDBAdapter implements DatabaseAdapter {
   name: DatabaseType = 'sdb'
-  private db: ReturnType<typeof import('@dotdo/sdb').DB> | null = null
 
   async connect(): Promise<void> {
-    const { DB } = await import('@dotdo/sdb')
-    // Create in-memory SDB instance for benchmarking
-    this.db = DB({ url: 'memory://' })
+    throw new Error('SDB adapter requires a running SDB Durable Object instance. TODO: Implement when endpoint is available.')
   }
 
-  async close(): Promise<void> {
-    this.db = null
+  async close(): Promise<void> {}
+
+  async pointLookup(_collection: string, _id: string): Promise<BenchDoc | null> {
+    throw new Error('Not implemented')
   }
 
-  private normalizeId(doc: Document): string {
-    return (doc.$id ?? doc.id ?? doc._id ?? '') as string
+  async rangeScan(_collection: string, _filter: Record<string, unknown>, _limit?: number): Promise<BenchDoc[]> {
+    throw new Error('Not implemented')
   }
 
-  async pointLookup(collection: string, id: string): Promise<Document | null> {
-    try {
-      const result = await this.db![collection][id]
-      return result as Document | null
-    } catch {
-      return null
-    }
+  async insert(_collection: string, _doc: BenchDoc): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async rangeScan(collection: string, filter: Record<string, unknown>, limit = 100): Promise<Document[]> {
-    const result = await this.db![collection].list({ where: filter, limit })
-    return result as Document[]
+  async batchInsert(_collection: string, _docs: BenchDoc[]): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async insert(collection: string, doc: Document): Promise<void> {
-    const id = this.normalizeId(doc)
-    const sdbDoc = { ...doc, $id: id }
-    await this.db![collection].create(sdbDoc)
+  async update(_collection: string, _id: string, _updates: Record<string, unknown>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async batchInsert(collection: string, docs: Document[]): Promise<void> {
-    for (const doc of docs) {
-      await this.insert(collection, doc)
-    }
+  async delete(_collection: string, _id: string): Promise<boolean> {
+    throw new Error('Not implemented')
   }
 
-  async update(collection: string, id: string, updates: Record<string, unknown>): Promise<void> {
-    await this.db![collection][id].update(updates)
+  async transaction(_fn: () => Promise<void>): Promise<void> {
+    throw new Error('Not implemented')
   }
 
-  async delete(collection: string, id: string): Promise<boolean> {
-    try {
-      await this.db![collection][id].delete()
-      return true
-    } catch {
-      return false
-    }
+  async loadData(_collection: string, _docs: BenchDoc[]): Promise<number> {
+    throw new Error('Not implemented')
   }
 
-  async transaction(fn: () => Promise<void>): Promise<void> {
-    // SDB uses batch operations
-    await fn()
-  }
-
-  async loadData(collection: string, docs: Document[]): Promise<number> {
-    await this.batchInsert(collection, docs)
-    return docs.length
-  }
-
-  async getCollectionIds(collection: string): Promise<string[]> {
-    const result = await this.db![collection].list({ limit: 10000 })
-    return (result as Document[]).map((d) => (d.$id ?? d.id ?? '') as string)
+  async getCollectionIds(_collection: string): Promise<string[]> {
+    throw new Error('Not implemented')
   }
 }
 
@@ -937,7 +769,7 @@ const DATASET_TABLES: Record<DatasetType, string[]> = {
 // ============================================================================
 
 export class OLTPBenchDO extends DurableObject<Env> {
-  private adapter: DatabaseAdapter | null = null
+  private adapter: DatabaseAdapter  | null = null
   private loadedData: Map<string, string[]> = new Map() // collection -> ids
   private dataLoaded = false
 

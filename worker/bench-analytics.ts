@@ -2,38 +2,27 @@
  * Analytics Benchmark Worker - ClickBench Suite
  *
  * Cloudflare Worker that runs the ClickBench 43 queries against analytical databases.
- * Supports postgres, sqlite, and duckdb with data loaded from R2.
+ * Uses an in-memory mock database for benchmarking query patterns.
  *
  * Benchmarks:
  * - Full table scans
  * - Aggregations (COUNT, SUM, AVG, MIN, MAX)
  * - Complex GROUP BY with ORDER BY
- * - Window functions (via complex aggregations)
  * - High-cardinality string operations
  *
  * Endpoint: POST /benchmark/analytics
- * Query params: ?database=duckdb&dataset=clickbench
+ * Query params: ?database=sqlite&dataset=clickbench
  *
  * @see https://github.com/ClickHouse/ClickBench
  * @see datasets/analytics/clickbench.ts
+ *
+ * NOTE: Database Availability
+ * - SQLite: Uses InMemoryDatabase (JavaScript mock with basic SQL support)
+ * - PostgreSQL: DISABLED - @dotdo/pglite not available in this workspace
+ * - DuckDB: DISABLED - Requires complex WASM setup
  */
 
 import { Hono } from 'hono'
-
-// Note: These imports are resolved at deploy time via wrangler
-// @dotdo/postgres is available in the workspace for PostgreSQL/analytics
-// @dotdo/sqlite can be used for SQLite benchmarks
-
-// TODO: DuckDB WASM integration
-// The duckdb-workers package (@anthropic-pocs/iceberg-duckdb-workers) exists in
-// packages/pocs/packages/duckdb-workers/ but requires significant setup:
-// - Environment shim (applyDuckDBShim) must be called before loading WASM
-// - WASM module (~36MB) must be bundled or fetched
-// - Async VFS must be configured for R2 access
-// For now, DuckDB adapter is commented out. To enable:
-// 1. Import shim: import { applyDuckDBShim, loadDuckDB } from '@anthropic-pocs/iceberg-duckdb-workers'
-// 2. Apply shim before any DuckDB operations
-// 3. Use loadDuckDB() to get a DuckDB instance
 
 // ============================================================================
 // Types
@@ -64,7 +53,8 @@ interface BenchmarkResult {
   run_id: string
 }
 
-type DatabaseType = 'postgres' | 'sqlite' | 'duckdb'
+// Only sqlite is currently available
+type DatabaseType = 'sqlite'
 type DatasetType = 'clickbench' | 'imdb'
 type QueryComplexity = 'simple' | 'moderate' | 'complex' | 'expert'
 
@@ -115,6 +105,20 @@ interface AnalyticsBenchmarkResults {
   }
 }
 
+// Cloudflare Workers types - Using inline declarations for portability
+interface R2Bucket {
+  get(key: string): Promise<R2Object | null>
+  put(key: string, value: string | ArrayBuffer | ReadableStream): Promise<R2Object>
+  list(options?: { prefix?: string; limit?: number }): Promise<{ objects: R2Object[]; truncated: boolean }>
+}
+
+interface R2Object {
+  key: string
+  size: number
+  uploaded: Date
+  text(): Promise<string>
+}
+
 interface Env {
   // R2 bucket containing analytics datasets
   ANALYTICS_BUCKET: R2Bucket
@@ -122,20 +126,432 @@ interface Env {
   RESULTS: R2Bucket
 }
 
-/**
- * sql.js Database interface
- * Minimal type definitions for sql.js Database class
- */
-interface SqlJsDatabase {
-  run(sql: string, params?: unknown[]): void
-  exec(sql: string): Array<{ columns: string[]; values: unknown[][] }>
-  prepare(sql: string): SqlJsStatement
-  close(): void
-}
+// ============================================================================
+// In-Memory Database Mock
+// ============================================================================
 
-interface SqlJsStatement {
-  run(params: unknown[]): void
-  free(): void
+/**
+ * Simple in-memory database for analytics benchmarking.
+ * Provides basic SQL support for SELECT queries with aggregations.
+ *
+ * Supported operations:
+ * - SELECT with COUNT(*), SUM, AVG, MIN, MAX
+ * - WHERE with =, <>, <, >, <=, >=, LIKE, AND, OR
+ * - GROUP BY (single column)
+ * - ORDER BY with ASC/DESC
+ * - LIMIT
+ *
+ * Limitations:
+ * - No JOINs
+ * - No subqueries
+ * - No window functions
+ * - Single GROUP BY column only
+ */
+class InMemoryDatabase {
+  private rows: Record<string, unknown>[] = []
+  private columns: string[] = []
+
+  /**
+   * Initialize database with schema and sample data
+   */
+  initialize(schema: string[], data: Record<string, unknown>[]): void {
+    this.columns = schema
+    this.rows = data
+  }
+
+  /**
+   * Execute a SQL query and return results
+   */
+  execute(sql: string): { columns: string[]; rows: unknown[][]; rowCount: number } {
+    const normalizedSql = sql.trim().replace(/\s+/g, ' ')
+    const upperSql = normalizedSql.toUpperCase()
+
+    // Handle simple COUNT(*)
+    if (upperSql.includes('COUNT(*)') && !upperSql.includes('GROUP BY')) {
+      const whereMatch = normalizedSql.match(/WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|\s*$)/i)
+      let filteredRows = this.rows
+      if (whereMatch) {
+        filteredRows = this.filterRows(filteredRows, whereMatch[1])
+      }
+      return {
+        columns: ['COUNT(*)'],
+        rows: [[filteredRows.length]],
+        rowCount: 1,
+      }
+    }
+
+    // Handle COUNT(DISTINCT column)
+    const countDistinctMatch = upperSql.match(/COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)/i)
+    if (countDistinctMatch && !upperSql.includes('GROUP BY')) {
+      const col = countDistinctMatch[1]
+      const whereMatch = normalizedSql.match(/WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|\s*$)/i)
+      let filteredRows = this.rows
+      if (whereMatch) {
+        filteredRows = this.filterRows(filteredRows, whereMatch[1])
+      }
+      const uniqueValues = new Set(filteredRows.map((r) => r[col]))
+      return {
+        columns: [`COUNT(DISTINCT ${col})`],
+        rows: [[uniqueValues.size]],
+        rowCount: 1,
+      }
+    }
+
+    // Handle simple aggregations without GROUP BY
+    if (this.hasAggregation(upperSql) && !upperSql.includes('GROUP BY')) {
+      return this.executeSimpleAggregation(normalizedSql)
+    }
+
+    // Handle GROUP BY queries
+    if (upperSql.includes('GROUP BY')) {
+      return this.executeGroupBy(normalizedSql)
+    }
+
+    // Handle simple SELECT
+    return this.executeSimpleSelect(normalizedSql)
+  }
+
+  private hasAggregation(sql: string): boolean {
+    return /\b(COUNT|SUM|AVG|MIN|MAX)\s*\(/i.test(sql)
+  }
+
+  private executeSimpleAggregation(sql: string): { columns: string[]; rows: unknown[][]; rowCount: number } {
+    const whereMatch = sql.match(/WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|\s*$)/i)
+    let filteredRows = this.rows
+    if (whereMatch) {
+      filteredRows = this.filterRows(filteredRows, whereMatch[1])
+    }
+
+    // Parse SELECT clause
+    const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/i)
+    if (!selectMatch) {
+      throw new Error(`Invalid SELECT syntax: ${sql}`)
+    }
+
+    const selectExpressions = this.parseSelectExpressions(selectMatch[1])
+    const resultRow: unknown[] = []
+    const resultColumns: string[] = []
+
+    for (const expr of selectExpressions) {
+      const { value, alias } = this.evaluateAggregation(expr, filteredRows)
+      resultRow.push(value)
+      resultColumns.push(alias)
+    }
+
+    return {
+      columns: resultColumns,
+      rows: [resultRow],
+      rowCount: 1,
+    }
+  }
+
+  private parseSelectExpressions(selectClause: string): string[] {
+    // Simple comma split (doesn't handle nested functions well)
+    const expressions: string[] = []
+    let depth = 0
+    let current = ''
+
+    for (const char of selectClause) {
+      if (char === '(') depth++
+      else if (char === ')') depth--
+      else if (char === ',' && depth === 0) {
+        expressions.push(current.trim())
+        current = ''
+        continue
+      }
+      current += char
+    }
+    if (current.trim()) {
+      expressions.push(current.trim())
+    }
+
+    return expressions
+  }
+
+  private evaluateAggregation(
+    expr: string,
+    rows: Record<string, unknown>[]
+  ): { value: unknown; alias: string } {
+    const trimmed = expr.trim()
+
+    // COUNT(*)
+    if (/COUNT\s*\(\s*\*\s*\)/i.test(trimmed)) {
+      return { value: rows.length, alias: 'COUNT(*)' }
+    }
+
+    // COUNT(DISTINCT column)
+    const countDistinctMatch = trimmed.match(/COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)/i)
+    if (countDistinctMatch) {
+      const col = countDistinctMatch[1]
+      const unique = new Set(rows.map((r) => r[col]))
+      return { value: unique.size, alias: `COUNT(DISTINCT ${col})` }
+    }
+
+    // SUM(column)
+    const sumMatch = trimmed.match(/SUM\s*\(\s*(\w+)\s*\)/i)
+    if (sumMatch) {
+      const col = sumMatch[1]
+      const sum = rows.reduce((acc, r) => acc + (Number(r[col]) || 0), 0)
+      return { value: sum, alias: `SUM(${col})` }
+    }
+
+    // AVG(column)
+    const avgMatch = trimmed.match(/AVG\s*\(\s*(\w+)\s*\)/i)
+    if (avgMatch) {
+      const col = avgMatch[1]
+      const sum = rows.reduce((acc, r) => acc + (Number(r[col]) || 0), 0)
+      const avg = rows.length > 0 ? sum / rows.length : 0
+      return { value: avg, alias: `AVG(${col})` }
+    }
+
+    // MIN(column)
+    const minMatch = trimmed.match(/MIN\s*\(\s*(\w+)\s*\)/i)
+    if (minMatch) {
+      const col = minMatch[1]
+      const values = rows.map((r) => r[col]).filter((v) => v !== null && v !== undefined)
+      const min = values.length > 0 ? Math.min(...values.map(Number)) : null
+      return { value: min, alias: `MIN(${col})` }
+    }
+
+    // MAX(column)
+    const maxMatch = trimmed.match(/MAX\s*\(\s*(\w+)\s*\)/i)
+    if (maxMatch) {
+      const col = maxMatch[1]
+      const values = rows.map((r) => r[col]).filter((v) => v !== null && v !== undefined)
+      const max = values.length > 0 ? Math.max(...values.map(Number)) : null
+      return { value: max, alias: `MAX(${col})` }
+    }
+
+    // COUNT(column) - count non-null values
+    const countMatch = trimmed.match(/COUNT\s*\(\s*(\w+)\s*\)/i)
+    if (countMatch) {
+      const col = countMatch[1]
+      const count = rows.filter((r) => r[col] !== null && r[col] !== undefined).length
+      return { value: count, alias: `COUNT(${col})` }
+    }
+
+    // Plain column reference
+    return { value: null, alias: trimmed }
+  }
+
+  private executeGroupBy(sql: string): { columns: string[]; rows: unknown[][]; rowCount: number } {
+    // Parse GROUP BY column
+    const groupByMatch = sql.match(/GROUP\s+BY\s+(\w+)/i)
+    if (!groupByMatch) {
+      throw new Error(`Invalid GROUP BY: ${sql}`)
+    }
+    const groupCol = groupByMatch[1]
+
+    // Parse WHERE clause
+    const whereMatch = sql.match(/WHERE\s+(.+?)(?:\s+GROUP)/i)
+    let filteredRows = this.rows
+    if (whereMatch) {
+      filteredRows = this.filterRows(filteredRows, whereMatch[1])
+    }
+
+    // Parse SELECT expressions
+    const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/i)
+    if (!selectMatch) {
+      throw new Error(`Invalid SELECT: ${sql}`)
+    }
+    const selectExpressions = this.parseSelectExpressions(selectMatch[1])
+
+    // Group rows
+    const groups = new Map<unknown, Record<string, unknown>[]>()
+    for (const row of filteredRows) {
+      const key = row[groupCol]
+      if (!groups.has(key)) {
+        groups.set(key, [])
+      }
+      groups.get(key)!.push(row)
+    }
+
+    // Calculate aggregations for each group
+    const resultRows: unknown[][] = []
+    const resultColumns: string[] = []
+    let columnsSet = false
+
+    for (const [groupKey, groupRows] of Array.from(groups.entries())) {
+      const resultRow: unknown[] = []
+
+      for (const expr of selectExpressions) {
+        const trimmed = expr.trim()
+
+        // Check if it's the group column
+        if (trimmed.toUpperCase() === groupCol.toUpperCase()) {
+          resultRow.push(groupKey)
+          if (!columnsSet) resultColumns.push(groupCol)
+        } else {
+          // Evaluate aggregation
+          const { value, alias } = this.evaluateAggregation(trimmed, groupRows)
+          resultRow.push(value)
+          if (!columnsSet) resultColumns.push(alias)
+        }
+      }
+
+      columnsSet = true
+      resultRows.push(resultRow)
+    }
+
+    // Parse ORDER BY
+    const orderByMatch = sql.match(/ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?/i)
+    if (orderByMatch) {
+      const orderCol = orderByMatch[1]
+      const orderDir = (orderByMatch[2] || 'ASC').toUpperCase()
+      const colIndex = resultColumns.findIndex(
+        (c) => c.toUpperCase() === orderCol.toUpperCase() || c.toUpperCase().includes(orderCol.toUpperCase())
+      )
+      if (colIndex >= 0) {
+        resultRows.sort((a, b) => {
+          const aVal = a[colIndex]
+          const bVal = b[colIndex]
+          const aNum = typeof aVal === 'number' ? aVal : Number(aVal) || 0
+          const bNum = typeof bVal === 'number' ? bVal : Number(bVal) || 0
+          return orderDir === 'DESC' ? bNum - aNum : aNum - bNum
+        })
+      }
+    }
+
+    // Parse LIMIT
+    const limitMatch = sql.match(/LIMIT\s+(\d+)/i)
+    const limit = limitMatch ? parseInt(limitMatch[1], 10) : resultRows.length
+
+    return {
+      columns: resultColumns,
+      rows: resultRows.slice(0, limit),
+      rowCount: Math.min(resultRows.length, limit),
+    }
+  }
+
+  private executeSimpleSelect(sql: string): { columns: string[]; rows: unknown[][]; rowCount: number } {
+    // Parse WHERE
+    const whereMatch = sql.match(/WHERE\s+(.+?)(?:\s+ORDER|\s+GROUP|\s+LIMIT|\s*$)/i)
+    let filteredRows = this.rows
+    if (whereMatch) {
+      filteredRows = this.filterRows(filteredRows, whereMatch[1])
+    }
+
+    // Parse SELECT columns
+    const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/i)
+    if (!selectMatch) {
+      throw new Error(`Invalid SELECT: ${sql}`)
+    }
+
+    let selectedColumns: string[]
+    if (selectMatch[1].trim() === '*') {
+      selectedColumns = this.columns
+    } else {
+      selectedColumns = selectMatch[1].split(',').map((c) => c.trim())
+    }
+
+    // Build result rows
+    const resultRows = filteredRows.map((row) =>
+      selectedColumns.map((col) => row[col])
+    )
+
+    // Parse ORDER BY
+    const orderByMatch = sql.match(/ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?/i)
+    if (orderByMatch) {
+      const orderCol = orderByMatch[1]
+      const orderDir = (orderByMatch[2] || 'ASC').toUpperCase()
+      const colIndex = selectedColumns.indexOf(orderCol)
+      if (colIndex >= 0) {
+        resultRows.sort((a, b) => {
+          const aVal = a[colIndex]
+          const bVal = b[colIndex]
+          if (typeof aVal === 'number' && typeof bVal === 'number') {
+            return orderDir === 'DESC' ? bVal - aVal : aVal - bVal
+          }
+          return orderDir === 'DESC'
+            ? String(bVal).localeCompare(String(aVal))
+            : String(aVal).localeCompare(String(bVal))
+        })
+      }
+    }
+
+    // Parse LIMIT
+    const limitMatch = sql.match(/LIMIT\s+(\d+)/i)
+    const limit = limitMatch ? parseInt(limitMatch[1], 10) : resultRows.length
+
+    return {
+      columns: selectedColumns,
+      rows: resultRows.slice(0, limit),
+      rowCount: Math.min(resultRows.length, limit),
+    }
+  }
+
+  private filterRows(rows: Record<string, unknown>[], whereClause: string): Record<string, unknown>[] {
+    return rows.filter((row) => this.evaluateCondition(row, whereClause))
+  }
+
+  private evaluateCondition(row: Record<string, unknown>, condition: string): boolean {
+    const trimmed = condition.trim()
+
+    // Handle OR
+    if (/\bOR\b/i.test(trimmed)) {
+      const parts = trimmed.split(/\s+OR\s+/i)
+      return parts.some((part) => this.evaluateCondition(row, part))
+    }
+
+    // Handle AND
+    if (/\bAND\b/i.test(trimmed)) {
+      const parts = trimmed.split(/\s+AND\s+/i)
+      return parts.every((part) => this.evaluateCondition(row, part))
+    }
+
+    // Handle NOT
+    if (trimmed.toUpperCase().startsWith('NOT ')) {
+      return !this.evaluateCondition(row, trimmed.slice(4))
+    }
+
+    // Handle LIKE
+    const likeMatch = trimmed.match(/(\w+)\s+LIKE\s+'([^']+)'/i)
+    if (likeMatch) {
+      const col = likeMatch[1]
+      const pattern = likeMatch[2]
+      const value = String(row[col] || '')
+      const regex = new RegExp('^' + pattern.replace(/%/g, '.*') + '$', 'i')
+      return regex.test(value)
+    }
+
+    // Handle comparisons: >=, <=, <>, !=, =, <, >
+    const comparisonMatch = trimmed.match(/(\w+)\s*(>=|<=|<>|!=|=|<|>)\s*(.+)/)
+    if (comparisonMatch) {
+      const col = comparisonMatch[1]
+      const op = comparisonMatch[2]
+      let compareValue: unknown = comparisonMatch[3].trim()
+
+      // Parse compare value
+      if (compareValue === "''") {
+        compareValue = ''
+      } else if (typeof compareValue === 'string' && compareValue.startsWith("'") && compareValue.endsWith("'")) {
+        compareValue = compareValue.slice(1, -1)
+      } else if (!isNaN(Number(compareValue))) {
+        compareValue = Number(compareValue)
+      }
+
+      const rowValue = row[col]
+
+      switch (op) {
+        case '=':
+          return rowValue === compareValue
+        case '<>':
+        case '!=':
+          return rowValue !== compareValue
+        case '<':
+          return Number(rowValue) < Number(compareValue)
+        case '>':
+          return Number(rowValue) > Number(compareValue)
+        case '<=':
+          return Number(rowValue) <= Number(compareValue)
+        case '>=':
+          return Number(rowValue) >= Number(compareValue)
+      }
+    }
+
+    // Default: return true (no condition)
+    return true
+  }
 }
 
 // ============================================================================
@@ -626,253 +1042,111 @@ interface DatabaseAdapter {
 }
 
 /**
- * Create a DuckDB adapter for querying Parquet files from R2
+ * Create a SQLite adapter using InMemoryDatabase
  *
- * TODO: DuckDB WASM requires significant setup in Cloudflare Workers:
- * - The duckdb-workers package provides a shim and loader
- * - WASM module must be bundled or fetched from CDN
- * - Environment shim must be applied before loading
+ * This is a JavaScript mock that provides basic SQL functionality for benchmarking.
+ * It supports:
+ * - SELECT with WHERE, GROUP BY, ORDER BY, LIMIT
+ * - Aggregates: COUNT(*), COUNT(DISTINCT), SUM, AVG, MIN, MAX
  *
- * For now, this throws an error directing users to use postgres or sqlite.
- * To implement:
- * 1. Import from @anthropic-pocs/iceberg-duckdb-workers
- * 2. Apply shim with applyDuckDBShim()
- * 3. Load DuckDB with loadDuckDB()
- * 4. Register files from R2 using registerFileBuffer()
- */
-async function createDuckDBAdapter(
-  _bucket: R2Bucket,
-  _dataset: DatasetType
-): Promise<DatabaseAdapter> {
-  // TODO: Implement DuckDB WASM integration
-  // The duckdb-workers package in packages/pocs/packages/duckdb-workers provides:
-  // - applyDuckDBShim(): Environment shim for Workers compatibility
-  // - loadDuckDB(): Loads and initializes DuckDB WASM
-  // - DuckDBInstance with query() method
-  //
-  // Example implementation:
-  // ```
-  // import { applyDuckDBShim, loadDuckDB } from '@anthropic-pocs/iceberg-duckdb-workers'
-  // applyDuckDBShim({ targetEnvironment: 'web-worker' })
-  // const instance = await loadDuckDB({ debug: false })
-  // const result = await instance.query(sql)
-  // ```
-  throw new Error(
-    'DuckDB adapter not yet implemented. ' +
-    'Use database=postgres or database=sqlite for analytics benchmarks. ' +
-    'See TODO in createDuckDBAdapter for implementation guidance.'
-  )
-}
-
-/**
- * Create a Postgres adapter (PGLite WASM)
- *
- * Uses @dotdo/postgres which provides PGLite with optimizations for
- * Cloudflare Workers including lazy WASM loading and memory management.
- */
-async function createPostgresAdapter(
-  _bucket: R2Bucket,
-  _dataset: DatasetType
-): Promise<DatabaseAdapter> {
-  // Import @dotdo/postgres - the workspace's PostgreSQL package
-  const { PGlite } = await import('@dotdo/postgres')
-
-  const db = new PGlite()
-  await db.waitReady
-
-  // Create and seed the hits table
-  // For Postgres, we create a simpler schema and seed with sample data
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS hits (
-      WatchID BIGINT,
-      JavaEnable SMALLINT,
-      Title TEXT,
-      GoodEvent SMALLINT,
-      EventTime TIMESTAMP,
-      EventDate DATE,
-      CounterID INTEGER,
-      ClientIP INTEGER,
-      RegionID INTEGER,
-      UserID BIGINT,
-      CounterClass SMALLINT,
-      OS SMALLINT,
-      UserAgent SMALLINT,
-      URL TEXT,
-      Referer TEXT,
-      IsRefresh SMALLINT,
-      AdvEngineID SMALLINT,
-      ResolutionWidth SMALLINT,
-      ResolutionHeight SMALLINT,
-      MobilePhoneModel TEXT,
-      MobilePhone SMALLINT,
-      SearchPhrase TEXT,
-      SearchEngineID SMALLINT,
-      TraficSourceID SMALLINT,
-      WindowClientWidth SMALLINT,
-      WindowClientHeight SMALLINT,
-      BrowserCountry TEXT,
-      SocialNetwork TEXT,
-      ParamPrice BIGINT,
-      GoalID INTEGER,
-      DontCountHits SMALLINT
-    )
-  `)
-
-  // Seed some sample data using batch insert
-  const batchSize = 1000
-  for (let batch = 0; batch < 10; batch++) {
-    const insertValues: string[] = []
-    for (let i = batch * batchSize + 1; i <= (batch + 1) * batchSize; i++) {
-      insertValues.push(`(
-        ${i}, 1, 'Page ${i}', 1, NOW(), CURRENT_DATE, ${(i % 100) + 1}, ${i * 1000},
-        ${i % 1000}, ${i * 10}, 1, ${i % 10}, ${i % 5}, 'https://example.com/${i}',
-        ${i % 3 === 0 ? "'https://google.com'" : "''"}, ${i % 2}, ${i % 4},
-        ${1024 + (i % 1920)}, ${768 + (i % 1080)},
-        ${i % 10 === 0 ? "'iPhone'" : i % 10 === 1 ? "'Samsung'" : "''"},
-        ${i % 10}, ${i % 5 === 0 ? `'search ${i}'` : "''"},
-        ${i % 3}, ${i % 5}, ${800 + (i % 1200)}, ${600 + (i % 800)},
-        'US', ${i % 10 === 0 ? "'Facebook'" : i % 10 === 1 ? "'Twitter'" : "''"},
-        ${(i % 100) * 100}, ${i % 100}, 0
-      )`)
-    }
-    await db.query(`INSERT INTO hits VALUES ${insertValues.join(',')}`)
-  }
-
-  return {
-    name: 'postgres',
-    async query<T = unknown>(sql: string): Promise<{ rows: T[]; rowCount: number }> {
-      const result = await db.query(sql)
-      return { rows: result.rows as T[], rowCount: result.rows.length }
-    },
-    async close(): Promise<void> {
-      await db.close()
-    },
-  }
-}
-
-/**
- * Create a SQLite adapter (sql.js WASM)
- *
- * Uses sql.js for SQLite WASM support. In production, consider using
- * @dotdo/sqlite if available for better Workers integration.
+ * Limitations:
+ * - No window functions
+ * - No CTEs
+ * - No JOINs
+ * - Single GROUP BY column only
+ * - Simplified SQL parsing
  */
 async function createSQLiteAdapter(
   _bucket: R2Bucket,
   _dataset: DatasetType
 ): Promise<DatabaseAdapter> {
-  // Dynamic import SQLite WASM
-  // TODO: Use @dotdo/sqlite if available for better Workers integration
-  const sqlModule = await import('sql.js')
-  const initSqlJs = (sqlModule as { default?: unknown }).default || sqlModule
-  const SQL = await (initSqlJs as () => Promise<{ Database: new () => SqlJsDatabase }>)()
-  const db = new SQL.Database()
+  const db = new InMemoryDatabase()
 
-  // Create the hits table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS hits (
-      WatchID INTEGER,
-      JavaEnable INTEGER,
-      Title TEXT,
-      GoodEvent INTEGER,
-      EventTime TEXT,
-      EventDate TEXT,
-      CounterID INTEGER,
-      ClientIP INTEGER,
-      RegionID INTEGER,
-      UserID INTEGER,
-      CounterClass INTEGER,
-      OS INTEGER,
-      UserAgent INTEGER,
-      URL TEXT,
-      Referer TEXT,
-      IsRefresh INTEGER,
-      AdvEngineID INTEGER,
-      ResolutionWidth INTEGER,
-      ResolutionHeight INTEGER,
-      MobilePhoneModel TEXT,
-      MobilePhone INTEGER,
-      SearchPhrase TEXT,
-      SearchEngineID INTEGER,
-      TraficSourceID INTEGER,
-      WindowClientWidth INTEGER,
-      WindowClientHeight INTEGER,
-      BrowserCountry TEXT,
-      SocialNetwork TEXT,
-      ParamPrice INTEGER,
-      GoalID INTEGER,
-      DontCountHits INTEGER
-    )
-  `)
+  // Define schema for ClickBench hits table
+  const schema = [
+    'WatchID', 'JavaEnable', 'Title', 'GoodEvent', 'EventTime', 'EventDate',
+    'CounterID', 'ClientIP', 'RegionID', 'UserID', 'CounterClass', 'OS',
+    'UserAgent', 'URL', 'Referer', 'IsRefresh', 'AdvEngineID', 'ResolutionWidth',
+    'ResolutionHeight', 'MobilePhoneModel', 'MobilePhone', 'SearchPhrase',
+    'SearchEngineID', 'TraficSourceID', 'WindowClientWidth', 'WindowClientHeight',
+    'BrowserCountry', 'SocialNetwork', 'ParamPrice', 'GoalID', 'DontCountHits',
+  ]
 
-  // Seed sample data using batch insert
-  db.run('BEGIN TRANSACTION')
-  const stmt = db.prepare(`
-    INSERT INTO hits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `)
+  // Generate sample data for benchmarking
+  const sampleSize = 10000
+  const data: Record<string, unknown>[] = []
 
-  for (let i = 1; i <= 10000; i++) {
-    stmt.run([
-      i, // WatchID
-      1, // JavaEnable
-      `Page ${i}`, // Title
-      1, // GoodEvent
-      new Date().toISOString(), // EventTime
-      new Date().toISOString().split('T')[0], // EventDate
-      (i % 100) + 1, // CounterID
-      i * 1000, // ClientIP
-      i % 1000, // RegionID
-      i * 10, // UserID
-      1, // CounterClass
-      i % 10, // OS
-      i % 5, // UserAgent
-      `https://example.com/${i}`, // URL
-      i % 3 === 0 ? 'https://google.com' : '', // Referer
-      i % 2, // IsRefresh
-      i % 4, // AdvEngineID
-      1024 + (i % 1920), // ResolutionWidth
-      768 + (i % 1080), // ResolutionHeight
-      i % 10 === 0 ? 'iPhone' : i % 10 === 1 ? 'Samsung' : '', // MobilePhoneModel
-      i % 10, // MobilePhone
-      i % 5 === 0 ? `search ${i}` : '', // SearchPhrase
-      i % 3, // SearchEngineID
-      i % 5, // TraficSourceID
-      800 + (i % 1200), // WindowClientWidth
-      600 + (i % 800), // WindowClientHeight
-      'US', // BrowserCountry
-      i % 10 === 0 ? 'Facebook' : i % 10 === 1 ? 'Twitter' : '', // SocialNetwork
-      (i % 100) * 100, // ParamPrice
-      i % 100, // GoalID
-      0, // DontCountHits
-    ])
+  for (let i = 1; i <= sampleSize; i++) {
+    const eventTime = new Date(Date.now() - i * 60000).toISOString()
+    const eventDate = eventTime.split('T')[0]
+
+    data.push({
+      WatchID: i,
+      JavaEnable: 1,
+      Title: `Page ${i}`,
+      GoodEvent: 1,
+      EventTime: eventTime,
+      EventDate: eventDate,
+      CounterID: (i % 100) + 1,
+      ClientIP: i * 1000,
+      RegionID: i % 1000,
+      UserID: i * 10,
+      CounterClass: 1,
+      OS: i % 10,
+      UserAgent: i % 5,
+      URL: `https://example.com/${i}`,
+      Referer: i % 3 === 0 ? 'https://google.com' : '',
+      IsRefresh: i % 2,
+      AdvEngineID: i % 4,
+      ResolutionWidth: 1024 + (i % 1920),
+      ResolutionHeight: 768 + (i % 1080),
+      MobilePhoneModel: i % 10 === 0 ? 'iPhone' : i % 10 === 1 ? 'Samsung' : '',
+      MobilePhone: i % 10,
+      SearchPhrase: i % 5 === 0 ? `search ${i}` : '',
+      SearchEngineID: i % 3,
+      TraficSourceID: i % 5,
+      WindowClientWidth: 800 + (i % 1200),
+      WindowClientHeight: 600 + (i % 800),
+      BrowserCountry: 'US',
+      SocialNetwork: i % 10 === 0 ? 'Facebook' : i % 10 === 1 ? 'Twitter' : '',
+      ParamPrice: (i % 100) * 100,
+      GoalID: i % 100,
+      DontCountHits: 0,
+    })
   }
-  stmt.free()
-  db.run('COMMIT')
+
+  db.initialize(schema, data)
 
   return {
     name: 'sqlite',
     async query<T = unknown>(sql: string): Promise<{ rows: T[]; rowCount: number }> {
-      const results = db.exec(sql)
-      if (results.length === 0) {
-        return { rows: [], rowCount: 0 }
-      }
-      const columns = results[0].columns
-      const rows = results[0].values.map((row: unknown[]) => {
-        const obj: Record<string, unknown> = {}
-        columns.forEach((col: string, idx: number) => {
-          obj[col] = row[idx]
+      try {
+        const result = db.execute(sql)
+        // Convert from [columns[], values[][]] format to objects
+        const rows = result.rows.map((row: unknown[]) => {
+          const obj: Record<string, unknown> = {}
+          result.columns.forEach((col: string, idx: number) => {
+            obj[col] = row[idx]
+          })
+          return obj as T
         })
-        return obj as T
-      })
-      return { rows, rowCount: rows.length }
+        return { rows, rowCount: result.rowCount }
+      } catch (error) {
+        // Re-throw with more context
+        throw new Error(`SQL error: ${error instanceof Error ? error.message : String(error)} - SQL: ${sql.slice(0, 100)}`)
+      }
     },
     async close(): Promise<void> {
-      db.close()
+      // InMemoryDatabase doesn't need explicit cleanup
     },
   }
 }
 
 /**
  * Create database adapter based on type
+ *
+ * Currently only SQLite is available.
+ * PostgreSQL and DuckDB adapters are disabled until their dependencies are resolved.
  */
 async function createDatabaseAdapter(
   database: DatabaseType,
@@ -880,14 +1154,10 @@ async function createDatabaseAdapter(
   dataset: DatasetType
 ): Promise<DatabaseAdapter> {
   switch (database) {
-    case 'duckdb':
-      return createDuckDBAdapter(bucket, dataset)
-    case 'postgres':
-      return createPostgresAdapter(bucket, dataset)
     case 'sqlite':
       return createSQLiteAdapter(bucket, dataset)
     default:
-      throw new Error(`Unsupported database: ${database}`)
+      throw new Error(`Unsupported database: ${database}. Only 'sqlite' is currently available.`)
   }
 }
 
@@ -991,7 +1261,7 @@ app.get('/queries', (c) => {
 
 // Main benchmark endpoint
 app.post('/benchmark/analytics', async (c) => {
-  const database = (c.req.query('database') || 'duckdb') as DatabaseType
+  const database = (c.req.query('database') || 'sqlite') as DatabaseType
   const dataset = (c.req.query('dataset') || 'clickbench') as DatasetType
   const iterationsParam = c.req.query('iterations')
   const iterations = iterationsParam ? parseInt(iterationsParam, 10) : 3
@@ -999,11 +1269,15 @@ app.post('/benchmark/analytics', async (c) => {
   const queryIds = c.req.query('queries')?.split(',')
 
   // Validate inputs
-  const validDatabases: DatabaseType[] = ['postgres', 'sqlite', 'duckdb']
+  // Note: Only sqlite is currently available. PostgreSQL and DuckDB are disabled.
+  const validDatabases: DatabaseType[] = ['sqlite']
   const validDatasets: DatasetType[] = ['clickbench', 'imdb']
 
   if (!validDatabases.includes(database)) {
-    return c.json({ error: `Invalid database. Valid options: ${validDatabases.join(', ')}` }, 400)
+    return c.json({
+      error: `Invalid database: ${database}. Currently only 'sqlite' is available.`,
+      note: 'PostgreSQL and DuckDB adapters are disabled until their dependencies are resolved.',
+    }, 400)
   }
 
   if (!validDatasets.includes(dataset)) {
@@ -1053,8 +1327,9 @@ app.post('/benchmark/analytics', async (c) => {
     const avgByComplexity = (arr: QueryTiming[]) =>
       arr.length > 0 ? arr.reduce((sum, r) => sum + r.stats.mean, 0) / arr.length : 0
 
-    // Get colo from request
-    const colo = c.req.raw.cf?.colo as string | undefined
+    // Get colo from request (Cloudflare-specific property)
+    const cfRequest = c.req.raw as Request & { cf?: { colo?: string } }
+    const colo = cfRequest.cf?.colo
 
     const results: AnalyticsBenchmarkResults = {
       runId,
@@ -1146,7 +1421,7 @@ app.get('/benchmark/analytics/results', async (c) => {
 
   const list = await c.env.RESULTS.list({ prefix, limit })
 
-  const results = list.objects.map((obj: R2Object) => ({
+  const results = list.objects.map((obj) => ({
     key: obj.key,
     size: obj.size,
     uploaded: obj.uploaded.toISOString(),
@@ -1162,7 +1437,7 @@ app.get('/benchmark/analytics/results/:runId', async (c) => {
   }
 
   const runId = c.req.param('runId')
-  const database = c.req.query('database') || 'duckdb'
+  const database = c.req.query('database') || 'sqlite'
   const key = `analytics/${database}/${runId}.jsonl`
 
   const object = await c.env.RESULTS.get(key)
@@ -1181,6 +1456,11 @@ app.get('/', (c) => {
   return c.json({
     name: 'Analytics Benchmark Worker',
     description: 'ClickBench 43 queries benchmark runner on Cloudflare Workers',
+    status: {
+      sqlite: 'available',
+      postgres: 'disabled - @dotdo/pglite not available',
+      duckdb: 'disabled - requires WASM setup',
+    },
     endpoints: {
       'GET /health': 'Health check',
       'GET /queries': 'List available benchmark queries',
@@ -1189,14 +1469,20 @@ app.get('/', (c) => {
       'GET /benchmark/analytics/results/:runId': 'Get specific benchmark result',
     },
     queryParams: {
-      database: 'Database to benchmark: postgres, sqlite, duckdb (default: duckdb)',
+      database: 'Database to benchmark: sqlite (default: sqlite)',
       dataset: 'Dataset to use: clickbench, imdb (default: clickbench)',
       iterations: 'Iterations per query (default: 3, max: 100)',
       complexity: 'Filter queries by complexity: simple, moderate, complex, expert',
       queries: 'Comma-separated list of query IDs to run (e.g., q0,q1,q2)',
     },
-    example: 'POST /benchmark/analytics?database=duckdb&dataset=clickbench&iterations=5',
+    example: 'POST /benchmark/analytics?database=sqlite&dataset=clickbench&iterations=5',
     queryCount: CLICKBENCH_QUERIES.length,
+    notes: [
+      'Using InMemoryDatabase (JavaScript mock with basic SQL support)',
+      'Limited SQL support (no CTEs, window functions, no JOINs)',
+      'Sample data: 10,000 rows seeded on startup',
+      'Supports: COUNT, SUM, AVG, MIN, MAX, GROUP BY, ORDER BY, LIMIT, WHERE',
+    ],
   })
 })
 

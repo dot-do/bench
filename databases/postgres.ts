@@ -44,10 +44,23 @@ let pgliteInstance: unknown = null
 /**
  * Create a new Postgres store instance.
  * Lazy-loads PGLite WASM on first instantiation.
+ *
+ * NOTE: Requires @electric-sql/pglite to be installed.
+ * This adapter is a placeholder for WASM database benchmarks.
  */
 export async function createPostgresStore(): Promise<PostgresStore> {
   // Lazy import PGLite WASM - this is the expensive operation
-  const { PGlite } = await import('@dotdo/postgres')
+  // Try @electric-sql/pglite (the real package) first, fall back to error
+  let PGlite: new () => unknown
+  try {
+    const pglite = await import('@electric-sql/pglite')
+    PGlite = pglite.PGlite
+  } catch {
+    throw new Error(
+      'Postgres WASM adapter requires @electric-sql/pglite package. ' +
+        'Install with: pnpm add @electric-sql/pglite'
+    )
+  }
 
   // Reuse WASM instance if available (for warm benchmarks)
   if (!pgliteInstance) {

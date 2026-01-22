@@ -47,10 +47,23 @@ let libsqlInstance: unknown = null
 /**
  * Create a new SQLite store instance.
  * Lazy-loads libsql WASM on first instantiation.
+ *
+ * NOTE: Requires @libsql/client to be installed.
+ * This adapter is a placeholder for WASM database benchmarks.
  */
 export async function createSQLiteStore(): Promise<SQLiteStore> {
   // Lazy import libsql WASM - this is the expensive operation
-  const { createClient } = await import('@dotdo/sqlite')
+  // Try @libsql/client (the real package) first, fall back to error
+  let createClient: (config: { url: string }) => unknown
+  try {
+    const libsql = await import('@libsql/client')
+    createClient = libsql.createClient
+  } catch {
+    throw new Error(
+      'SQLite WASM adapter requires @libsql/client package. ' +
+        'Install with: pnpm add @libsql/client'
+    )
+  }
 
   // Reuse WASM instance if available (for warm benchmarks)
   if (!libsqlInstance) {

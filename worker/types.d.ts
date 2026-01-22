@@ -1,5 +1,62 @@
 // Type declarations for optional/external modules
 
+// Cloudflare Workers modules
+declare module 'cloudflare:workers' {
+  export class DurableObject {
+    constructor(ctx: DurableObjectState, env: unknown)
+    fetch(request: Request): Promise<Response>
+    alarm?(): Promise<void>
+    webSocketMessage?(ws: WebSocket, message: string | ArrayBuffer): void
+    webSocketClose?(ws: WebSocket, code: number, reason: string, wasClean: boolean): void
+    webSocketError?(ws: WebSocket, error: unknown): void
+  }
+}
+
+interface DurableObjectState {
+  id: DurableObjectId
+  storage: DurableObjectStorage
+  waitUntil(promise: Promise<unknown>): void
+  blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T>
+}
+
+interface DurableObjectId {
+  toString(): string
+  equals(other: DurableObjectId): boolean
+}
+
+interface DurableObjectStorage {
+  get<T = unknown>(key: string): Promise<T | undefined>
+  get<T = unknown>(keys: string[]): Promise<Map<string, T>>
+  list<T = unknown>(options?: { start?: string; startAfter?: string; end?: string; prefix?: string; reverse?: boolean; limit?: number }): Promise<Map<string, T>>
+  put<T>(key: string, value: T): Promise<void>
+  put<T>(entries: Record<string, T>): Promise<void>
+  delete(key: string): Promise<boolean>
+  delete(keys: string[]): Promise<number>
+  deleteAll(): Promise<void>
+  transaction<T>(closure: (txn: DurableObjectTransaction) => Promise<T>): Promise<T>
+  getAlarm(): Promise<number | null>
+  setAlarm(scheduledTime: number | Date): Promise<void>
+  deleteAlarm(): Promise<void>
+  sync(): Promise<void>
+}
+
+interface DurableObjectTransaction extends DurableObjectStorage {
+  rollback(): void
+}
+
+interface DurableObjectNamespace {
+  idFromName(name: string): DurableObjectId
+  idFromString(id: string): DurableObjectId
+  newUniqueId(options?: { jurisdiction?: 'eu' }): DurableObjectId
+  get(id: DurableObjectId): DurableObjectStub
+}
+
+interface DurableObjectStub {
+  id: DurableObjectId
+  name?: string
+  fetch(request: Request | string, init?: RequestInit): Promise<Response>
+}
+
 // DuckDB modules
 declare module '@dotdo/duckdb' {
   export function getJsDelivrBundles(): unknown

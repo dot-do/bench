@@ -16,6 +16,6 @@
     "sourceMap": true,
     "types": ["node", "@cloudflare/workers-types"]
   },
-  "include": ["benchmarks/**/*.ts", "databases/**/*.ts", "scripts/**/*.ts", "worker/**/*.ts", "instrumentation/**/*.ts", "containers/**/*.ts"],
+  "include": ["benchmarks/**/*.ts", "databases/**/*.ts", "scripts/**/*.ts", "worker/**/*.ts", "instrumentation/**/*.ts", "containers/**/*.ts", "types/**/*.d.ts"],
   "exclude": ["node_modules", "dist", "packages"]
 }
