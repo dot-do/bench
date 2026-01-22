@@ -1,13 +1,17 @@
 # SQLite Container for Cloudflare Containers
 # Alpine-based with SQLite3 and HTTP bridge
-FROM alpine:3.19
+# Designed for linux/amd64 architecture
+FROM --platform=linux/amd64 alpine:3.19
 
-# Install dependencies
+# Install dependencies (including build tools for better-sqlite3 native module)
 RUN apk add --no-cache \
     nodejs \
     npm \
     sqlite \
-    curl
+    curl \
+    python3 \
+    make \
+    g++
 
 # Create HTTP bridge directory
 WORKDIR /app
@@ -31,18 +35,20 @@ RUN cat > /app/server.mjs << 'EOF'
 import { createServer } from 'http';
 import Database from 'better-sqlite3';
 
-// Database cache
+// Database cache for multiple named databases
 const databases = new Map();
 
 function getDatabase(dbPath) {
-  if (!databases.has(dbPath)) {
-    const db = new Database(dbPath === ':memory:' ? ':memory:' : `/data/${dbPath}`);
+  const key = dbPath || ':memory:';
+  if (!databases.has(key)) {
+    const db = new Database(key === ':memory:' ? ':memory:' : `/data/${key}`);
     db.pragma('journal_mode = WAL');
     db.pragma('busy_timeout = 5000');
     db.pragma('foreign_keys = ON');
-    databases.set(dbPath, db);
+    db.pragma('synchronous = NORMAL');
+    databases.set(key, db);
   }
-  return databases.get(dbPath);
+  return databases.get(key);
 }
 
 const server = createServer(async (req, res) => {
@@ -87,24 +93,41 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const body = await new Promise((resolve) => {
+    const body = await new Promise((resolve, reject) => {
       let data = '';
       req.on('data', chunk => data += chunk);
-      req.on('end', () => resolve(JSON.parse(data || '{}')));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data || '{}'));
+        } catch (e) {
+          reject(new Error('Invalid JSON body'));
+        }
+      });
+      req.on('error', reject);
     });
 
     const db = getDatabase(body.database || ':memory:');
 
     if (url.pathname === '/query') {
-      const stmt = db.prepare(body.query);
-      const isSelect = body.query.trim().toUpperCase().startsWith('SELECT') ||
-                       body.query.trim().toUpperCase().startsWith('PRAGMA');
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+
+      const stmt = db.prepare(sql);
+      const isSelect = sql.trim().toUpperCase().startsWith('SELECT') ||
+                       sql.trim().toUpperCase().startsWith('PRAGMA') ||
+                       sql.trim().toUpperCase().startsWith('EXPLAIN');
 
       if (isSelect) {
         const rows = stmt.all(...(body.params || []));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           rows,
+          rowCount: rows.length,
           rowsAffected: 0,
           lastInsertRowid: null,
           changes: 0,
@@ -114,6 +137,7 @@ const server = createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           rows: [],
+          rowCount: 0,
           rowsAffected: result.changes,
           lastInsertRowid: result.lastInsertRowid,
           changes: result.changes,
@@ -123,10 +147,19 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/execute') {
-      const stmt = db.prepare(body.query);
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+
+      const stmt = db.prepare(sql);
       const result = stmt.run(...(body.params || []));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
+        success: true,
         rowsAffected: result.changes,
         lastInsertRowid: result.lastInsertRowid,
       }));
@@ -134,25 +167,33 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/batch') {
+      const statements = body.statements || [];
       const results = [];
-      const transaction = db.transaction((statements) => {
-        for (const stmt of statements) {
-          const prepared = db.prepare(stmt.sql);
-          const isSelect = stmt.sql.trim().toUpperCase().startsWith('SELECT') ||
-                           stmt.sql.trim().toUpperCase().startsWith('PRAGMA');
+
+      const transaction = db.transaction((stmts) => {
+        for (const s of stmts) {
+          const sql = s.sql || s.query;
+          if (!sql) continue;
+
+          const prepared = db.prepare(sql);
+          const isSelect = sql.trim().toUpperCase().startsWith('SELECT') ||
+                           sql.trim().toUpperCase().startsWith('PRAGMA') ||
+                           sql.trim().toUpperCase().startsWith('EXPLAIN');
 
           if (isSelect) {
-            const rows = prepared.all(...(stmt.params || []));
+            const rows = prepared.all(...(s.params || []));
             results.push({
               rows,
+              rowCount: rows.length,
               rowsAffected: 0,
               lastInsertRowid: null,
               changes: 0,
             });
           } else {
-            const result = prepared.run(...(stmt.params || []));
+            const result = prepared.run(...(s.params || []));
             results.push({
               rows: [],
+              rowCount: 0,
               rowsAffected: result.changes,
               lastInsertRowid: result.lastInsertRowid,
               changes: result.changes,
@@ -161,16 +202,34 @@ const server = createServer(async (req, res) => {
         }
       });
 
-      transaction(body.statements || []);
+      transaction(statements);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(results));
       return;
     }
 
     if (url.pathname === '/backup') {
-      await db.backup(body.destination);
+      const dest = body.destination || body.dest;
+      if (!dest) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing destination parameter' }));
+        return;
+      }
+      await db.backup(`/data/${dest}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));
+      return;
+    }
+
+    if (url.pathname === '/tables') {
+      const tables = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+      ).all();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        rows: tables,
+        rowCount: tables.length,
+      }));
       return;
     }
 
@@ -188,8 +247,11 @@ server.listen(8080, '0.0.0.0', () => {
 });
 EOF
 
-# Create data directory
+# Create data directory for persistent databases
 RUN mkdir -p /data
+
+# Environment variables
+ENV SQLITE_DB=:memory:
 
 # Expose HTTP bridge port
 EXPOSE 8080

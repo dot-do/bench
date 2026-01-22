@@ -15,36 +15,24 @@
  */
 
 import { Hono } from 'hono'
+import { getContainer, type Container } from '@cloudflare/containers'
 
-// Container adapters
-import type { Container } from '@cloudflare/containers'
-import {
-  type ContainerDatabase,
-  type ContainerSize,
-  createPostgresContainer,
-  createClickHouseContainer,
-  createMongoContainer,
-  createDuckDBContainer,
-  createSQLiteContainer,
-} from '../containers/index.js'
-
-// Container Durable Objects
-import {
-  PostgresContainerDO,
-  ClickHouseContainerDO,
-  MongoContainerDO,
-  DuckDBContainerDO,
-  SQLiteContainerDO,
+// Export Container DO classes for wrangler to bind
+export {
+  PostgresBenchContainer,
+  ClickHouseBenchContainer,
+  MongoBenchContainer,
+  DuckDBBenchContainer,
+  SQLiteBenchContainer,
 } from './adapters/container-do.js'
 
-// Re-export DO classes for wrangler
-export {
-  PostgresContainerDO,
-  ClickHouseContainerDO,
-  MongoContainerDO,
-  DuckDBContainerDO,
-  SQLiteContainerDO,
-}
+// Container adapters
+import {
+  type ContainerSize,
+} from '../containers/index.js'
+
+// Import MongoContainer for MongoDB-specific operations
+import type { MongoContainer } from '../containers/mongo.js'
 
 // WASM database types
 import type { PostgresStore } from '../databases/postgres.js'
@@ -53,19 +41,17 @@ import type { DuckDBStore } from '../databases/duckdb.js'
 
 // Environment bindings
 interface Env {
-  // Container bindings (direct container access)
-  POSTGRES_CONTAINER: Container
-  CLICKHOUSE_CONTAINER: Container
-  MONGO_CONTAINER: Container
-  DUCKDB_CONTAINER: Container
-  SQLITE_CONTAINER: Container
-
-  // Durable Object namespaces for container management
-  POSTGRES_DO: DurableObjectNamespace
-  CLICKHOUSE_DO: DurableObjectNamespace
-  MONGO_DO: DurableObjectNamespace
-  DUCKDB_DO: DurableObjectNamespace
-  SQLITE_DO: DurableObjectNamespace
+  // Container Durable Object namespaces for container management
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  POSTGRES_DO: DurableObjectNamespace<any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  CLICKHOUSE_DO: DurableObjectNamespace<any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  MONGO_DO: DurableObjectNamespace<any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  DUCKDB_DO: DurableObjectNamespace<any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  SQLITE_DO: DurableObjectNamespace<any>
 
   // R2 bucket for storing results
   BENCHMARK_RESULTS: R2Bucket
@@ -235,30 +221,403 @@ function getOperationQueries(database: DatabaseType, operation: BenchmarkOperati
   throw new Error(`Unknown database: ${database}`)
 }
 
+// Container ports for each database type
+const CONTAINER_PORTS = {
+  postgres: 8080,    // HTTP bridge
+  clickhouse: 8123,  // Native HTTP
+  mongo: 8080,       // HTTP bridge
+  duckdb: 9999,      // HTTP bridge
+  sqlite: 8080,      // HTTP bridge
+} as const
+
+// Container stub type from getContainer
+type ContainerStub = ReturnType<typeof getContainer>
+
+// Container adapter interface for benchmark operations
+interface ContainerAdapter {
+  sessionId: string
+  database: DatabaseType
+  container: ContainerStub
+  port: number
+}
+
 /**
- * Create container database adapter
+ * Create container adapter using getContainer
  */
 function createContainerAdapter(
   env: Env,
   database: DatabaseType,
-  size: ContainerSize
-): ContainerDatabase {
-  const sessionId = crypto.randomUUID()
+  _size: ContainerSize
+): ContainerAdapter {
+  const sessionId = `bench-${crypto.randomUUID()}`
 
+  // Get container instance using getContainer based on database type
+  let container: ContainerStub
+
+  // Use type assertion for getContainer - the runtime types work correctly
+  // but the TypeScript types from @cloudflare/workers-types and @cloudflare/containers
+  // don't align perfectly. getContainer expects DurableObjectNamespace<Container>.
   switch (database) {
     case 'postgres':
-      return createPostgresContainer(env.POSTGRES_CONTAINER, { sessionId, size })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container = getContainer(env.POSTGRES_DO as any, sessionId)
+      break
     case 'clickhouse':
-      return createClickHouseContainer(env.CLICKHOUSE_CONTAINER, { sessionId, size })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container = getContainer(env.CLICKHOUSE_DO as any, sessionId)
+      break
     case 'mongo':
-      return createMongoContainer(env.MONGO_CONTAINER, { sessionId, size })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container = getContainer(env.MONGO_DO as any, sessionId)
+      break
     case 'duckdb':
-      return createDuckDBContainer(env.DUCKDB_CONTAINER, { sessionId, size })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container = getContainer(env.DUCKDB_DO as any, sessionId)
+      break
     case 'sqlite':
-      return createSQLiteContainer(env.SQLITE_CONTAINER, { sessionId, size })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      container = getContainer(env.SQLITE_DO as any, sessionId)
+      break
     default:
       throw new Error(`Unknown database: ${database}`)
   }
+
+  return {
+    sessionId,
+    database,
+    container,
+    port: CONTAINER_PORTS[database],
+  }
+}
+
+/**
+ * Execute SQL query on container via HTTP
+ */
+async function containerQuery<T = unknown>(
+  adapter: ContainerAdapter,
+  sql: string,
+  params?: unknown[]
+): Promise<T[]> {
+  const { container, database, port } = adapter
+
+  let request: Request
+
+  switch (database) {
+    case 'postgres':
+    case 'sqlite':
+    case 'duckdb':
+      // HTTP bridge with POST /query
+      request = new Request(`http://container:${port}/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, params: params ?? [] }),
+      })
+      break
+
+    case 'clickhouse':
+      // Native HTTP interface - POST with SQL body
+      request = new Request(`http://container:${port}/?default_format=JSONEachRow`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: processClickHouseParams(sql, params),
+      })
+      break
+
+    case 'mongo':
+      // For MongoDB, use the generic query endpoint
+      request = new Request(`http://container:${port}/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, params: params ?? [] }),
+      })
+      break
+
+    default:
+      throw new Error(`Unknown database: ${database}`)
+  }
+
+  const response = await container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`${database} query failed: ${error}`)
+  }
+
+  // Parse response based on database type
+  if (database === 'clickhouse') {
+    const text = await response.text()
+    if (!text.trim()) return []
+    return text.trim().split('\n').map(line => JSON.parse(line) as T)
+  }
+
+  const result = await response.json() as { rows?: T[], documents?: T[] }
+  return result.rows ?? result.documents ?? []
+}
+
+/**
+ * Execute SQL statement on container via HTTP
+ */
+async function containerExecute(
+  adapter: ContainerAdapter,
+  sql: string,
+  params?: unknown[]
+): Promise<{ rowsAffected: number }> {
+  const { container, database, port } = adapter
+
+  let request: Request
+
+  switch (database) {
+    case 'postgres':
+    case 'sqlite':
+    case 'duckdb':
+      // HTTP bridge with POST /execute
+      request = new Request(`http://container:${port}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, params: params ?? [] }),
+      })
+      break
+
+    case 'clickhouse':
+      // Native HTTP interface
+      request = new Request(`http://container:${port}/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: processClickHouseParams(sql, params),
+      })
+      break
+
+    case 'mongo':
+      request = new Request(`http://container:${port}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sql, params: params ?? [] }),
+      })
+      break
+
+    default:
+      throw new Error(`Unknown database: ${database}`)
+  }
+
+  const response = await container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`${database} execute failed: ${error}`)
+  }
+
+  if (database === 'clickhouse') {
+    const summary = response.headers.get('X-ClickHouse-Summary')
+    if (summary) {
+      const parsed = JSON.parse(summary) as { written_rows?: string }
+      return { rowsAffected: parseInt(parsed.written_rows ?? '0', 10) }
+    }
+    return { rowsAffected: 0 }
+  }
+
+  const result = await response.json() as { rowsAffected?: number }
+  return { rowsAffected: result.rowsAffected ?? 0 }
+}
+
+/**
+ * Check if container is ready
+ */
+async function containerReady(adapter: ContainerAdapter): Promise<boolean> {
+  const { container, database, port } = adapter
+
+  try {
+    const healthPath = database === 'clickhouse' ? '/ping' : '/ready'
+    const request = new Request(`http://container:${port}${healthPath}`, {
+      method: 'GET',
+    })
+
+    const response = await container.fetch(request)
+    return response.ok
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Wait for container to be ready
+ */
+async function waitForContainerReady(
+  adapter: ContainerAdapter,
+  maxAttempts = 30,
+  delayMs = 1000
+): Promise<void> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (await containerReady(adapter)) {
+      return
+    }
+    await sleep(delayMs)
+  }
+  throw new Error(`${adapter.database} container failed to become ready`)
+}
+
+/**
+ * Process ClickHouse parameters (replace $1, $2, etc.)
+ */
+function processClickHouseParams(sql: string, params?: unknown[]): string {
+  if (!params || params.length === 0) return sql
+
+  let processed = sql
+  params.forEach((param, index) => {
+    const placeholder = `$${index + 1}`
+    const value = formatClickHouseValue(param)
+    processed = processed.replace(placeholder, value)
+  })
+
+  return processed
+}
+
+/**
+ * Format value for ClickHouse
+ */
+function formatClickHouseValue(value: unknown): string {
+  if (value === null || value === undefined) return 'NULL'
+  if (typeof value === 'string') return `'${value.replace(/'/g, "''")}'`
+  if (typeof value === 'number') return String(value)
+  if (typeof value === 'boolean') return value ? '1' : '0'
+  if (value instanceof Date) return `'${value.toISOString()}'`
+  return `'${JSON.stringify(value).replace(/'/g, "''")}'`
+}
+
+/**
+ * MongoDB-specific operations via HTTP bridge
+ */
+async function mongoFind<T = unknown>(
+  adapter: ContainerAdapter,
+  collection: string,
+  filter: Record<string, unknown>,
+  options?: { sort?: Record<string, number>; limit?: number }
+): Promise<T[]> {
+  const request = new Request(`http://container:${adapter.port}/find`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      database: 'benchmark',
+      collection,
+      filter,
+      ...options,
+    }),
+  })
+
+  const response = await adapter.container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`MongoDB find failed: ${error}`)
+  }
+
+  const result = await response.json() as { documents: T[] }
+  return result.documents
+}
+
+async function mongoFindOne<T = unknown>(
+  adapter: ContainerAdapter,
+  collection: string,
+  filter: Record<string, unknown>
+): Promise<T | null> {
+  const request = new Request(`http://container:${adapter.port}/findOne`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      database: 'benchmark',
+      collection,
+      filter,
+    }),
+  })
+
+  const response = await adapter.container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`MongoDB findOne failed: ${error}`)
+  }
+
+  const result = await response.json() as { document: T | null }
+  return result.document
+}
+
+async function mongoInsertOne(
+  adapter: ContainerAdapter,
+  collection: string,
+  document: Record<string, unknown>
+): Promise<{ insertedId?: string; insertedCount?: number }> {
+  const request = new Request(`http://container:${adapter.port}/insertOne`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      database: 'benchmark',
+      collection,
+      document,
+    }),
+  })
+
+  const response = await adapter.container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`MongoDB insertOne failed: ${error}`)
+  }
+
+  return response.json() as Promise<{ insertedId?: string; insertedCount?: number }>
+}
+
+async function mongoInsertMany(
+  adapter: ContainerAdapter,
+  collection: string,
+  documents: Record<string, unknown>[]
+): Promise<{ insertedCount?: number }> {
+  const request = new Request(`http://container:${adapter.port}/insertMany`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      database: 'benchmark',
+      collection,
+      documents,
+    }),
+  })
+
+  const response = await adapter.container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`MongoDB insertMany failed: ${error}`)
+  }
+
+  return response.json() as Promise<{ insertedCount?: number }>
+}
+
+async function mongoAggregate<T = unknown>(
+  adapter: ContainerAdapter,
+  collection: string,
+  pipeline: Record<string, unknown>[]
+): Promise<T[]> {
+  const request = new Request(`http://container:${adapter.port}/aggregate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      database: 'benchmark',
+      collection,
+      pipeline,
+    }),
+  })
+
+  const response = await adapter.container.fetch(request)
+
+  if (!response.ok) {
+    const error = await response.text()
+    throw new Error(`MongoDB aggregate failed: ${error}`)
+  }
+
+  const result = await response.json() as { documents: T[] }
+  return result.documents
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 /**
@@ -276,7 +635,7 @@ async function benchmarkContainer(
   // Measure cold start (container startup + connection)
   const coldStartTime = performance.now()
   const adapter = createContainerAdapter(env, database, size)
-  await adapter.connect()
+  await waitForContainerReady(adapter)
   const coldStartMs = performance.now() - coldStartTime
 
   // Setup schema/data
@@ -284,13 +643,11 @@ async function benchmarkContainer(
 
   if (database !== 'mongo') {
     for (const sql of setup) {
-      await adapter.execute(sql)
+      await containerExecute(adapter, sql)
     }
   } else {
-    // MongoDB setup
-    const mongoAdapter = adapter as import('../containers/mongo.js').MongoContainer
-    // Seed some test data
-    await mongoAdapter.insertMany('benchmark_items', [
+    // MongoDB setup - seed test data
+    await mongoInsertMany(adapter, 'benchmark_items', [
       { _id: 'item-001', name: 'Item 1', value: 100, category: 'A' },
       { _id: 'item-002', name: 'Item 2', value: 200, category: 'B' },
       { _id: 'item-003', name: 'Item 3', value: 300, category: 'A' },
@@ -304,16 +661,15 @@ async function benchmarkContainer(
     const start = performance.now()
 
     if (database === 'mongo') {
-      const mongoAdapter = adapter as import('../containers/mongo.js').MongoContainer
       switch (operation) {
         case 'point_lookup':
-          await mongoAdapter.findOne('benchmark_items', { _id: 'item-001' })
+          await mongoFindOne(adapter, 'benchmark_items', { _id: 'item-001' })
           break
         case 'range_scan':
-          await mongoAdapter.find('benchmark_items', { category: 'A' }, { sort: { value: 1 } })
+          await mongoFind(adapter, 'benchmark_items', { category: 'A' }, { sort: { value: 1 } })
           break
         case 'insert':
-          await mongoAdapter.insertOne('benchmark_items', {
+          await mongoInsertOne(adapter, 'benchmark_items', {
             _id: `item-${Date.now()}-${i}`,
             name: 'Benchmark Item',
             value: Math.floor(Math.random() * 1000),
@@ -321,19 +677,19 @@ async function benchmarkContainer(
           })
           break
         case 'aggregate':
-          await mongoAdapter.aggregate('benchmark_items', [
+          await mongoAggregate(adapter, 'benchmark_items', [
             { $group: { _id: '$category', count: { $sum: 1 }, avg_value: { $avg: '$value' } } },
           ])
           break
       }
     } else {
-      await adapter.query(query, params)
+      await containerQuery(adapter, query, params)
     }
 
     warmQueryMs.push(performance.now() - start)
   }
 
-  await adapter.close()
+  // Container connections are stateless via HTTP, no close needed
 
   return {
     operation,

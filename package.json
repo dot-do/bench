@@ -37,6 +37,7 @@
     "wrangler": "^3.100.0"
   },
   "dependencies": {
+    "@cloudflare/containers": "^0.1.0",
     "@db4/client": "^0.1.0",
     "@db4/core": "^0.1.0",
     "@db4/do": "^0.1.0",

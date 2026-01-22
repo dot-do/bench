@@ -56,6 +56,7 @@ export async function createSQLiteStore(): Promise<SQLiteStore> {
   // Try @libsql/client (the real package) first, fall back to error
   let createClient: (config: { url: string }) => unknown
   try {
+    // @ts-expect-error Optional dependency - may not be installed
     const libsql = await import('@libsql/client')
     createClient = libsql.createClient
   } catch {

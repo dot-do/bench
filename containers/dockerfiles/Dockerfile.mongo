@@ -1,6 +1,7 @@
 # MongoDB Container for Cloudflare Containers
 # Includes HTTP bridge for Worker communication
-FROM mongo:7
+# Designed for linux/amd64 architecture
+FROM --platform=linux/amd64 mongo:7
 
 # Install Node.js for HTTP bridge
 RUN apt-get update && apt-get install -y \
@@ -8,6 +9,9 @@ RUN apt-get update && apt-get install -y \
     npm \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Environment variables
+ENV MONGODB_URI=mongodb://localhost:27017
 
 # Create HTTP bridge directory
 WORKDIR /app
@@ -42,6 +46,24 @@ async function connect() {
     connected = true;
   }
   return client;
+}
+
+// Parse ObjectId strings in filter objects
+function parseObjectIds(obj) {
+  if (obj === null || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(parseObjectIds);
+
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value === 'string' && /^[0-9a-fA-F]{24}$/.test(value) && key === '_id') {
+      result[key] = new ObjectId(value);
+    } else if (typeof value === 'object' && value !== null) {
+      result[key] = parseObjectIds(value);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
 }
 
 const server = createServer(async (req, res) => {
@@ -86,18 +108,131 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const body = await new Promise((resolve) => {
+    const body = await new Promise((resolve, reject) => {
       let data = '';
       req.on('data', chunk => data += chunk);
-      req.on('end', () => resolve(JSON.parse(data || '{}')));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data || '{}'));
+        } catch (e) {
+          reject(new Error('Invalid JSON body'));
+        }
+      });
+      req.on('error', reject);
     });
 
     const c = await connect();
     const db = c.db(body.database || 'test');
     const collection = body.collection ? db.collection(body.collection) : null;
 
+    // Generic query endpoint - supports MongoDB operations via JSON
+    // Format: { sql: "find|insertOne|updateOne|deleteOne|aggregate", params: {...} }
+    // Or use the operation-specific endpoints below
+    if (url.pathname === '/query') {
+      const operation = body.sql || body.query || body.operation;
+      const params = body.params || {};
+
+      if (!operation) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql/query/operation parameter' }));
+        return;
+      }
+
+      if (!collection && !['listCollections', 'listDatabases', 'createCollection'].includes(operation)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing collection parameter' }));
+        return;
+      }
+
+      let result;
+      const filter = parseObjectIds(params.filter || {});
+
+      switch (operation) {
+        case 'find':
+          const cursor = collection.find(filter, {
+            projection: params.projection,
+            sort: params.sort,
+            limit: params.limit,
+            skip: params.skip,
+          });
+          result = { rows: await cursor.toArray(), rowCount: await collection.countDocuments(filter) };
+          break;
+
+        case 'findOne':
+          const doc = await collection.findOne(filter, { projection: params.projection });
+          result = { rows: doc ? [doc] : [], rowCount: doc ? 1 : 0 };
+          break;
+
+        case 'insertOne':
+          const insertResult = await collection.insertOne(params.document || params.doc);
+          result = { rows: [], rowCount: 1, insertedId: insertResult.insertedId?.toString() };
+          break;
+
+        case 'insertMany':
+          const insertManyResult = await collection.insertMany(params.documents || params.docs);
+          result = { rows: [], rowCount: insertManyResult.insertedCount };
+          break;
+
+        case 'updateOne':
+          const updateResult = await collection.updateOne(filter, params.update, { upsert: params.upsert });
+          result = { rows: [], rowCount: updateResult.modifiedCount, matchedCount: updateResult.matchedCount };
+          break;
+
+        case 'updateMany':
+          const updateManyResult = await collection.updateMany(filter, params.update, { upsert: params.upsert });
+          result = { rows: [], rowCount: updateManyResult.modifiedCount, matchedCount: updateManyResult.matchedCount };
+          break;
+
+        case 'deleteOne':
+          const deleteResult = await collection.deleteOne(filter);
+          result = { rows: [], rowCount: deleteResult.deletedCount };
+          break;
+
+        case 'deleteMany':
+          const deleteManyResult = await collection.deleteMany(filter);
+          result = { rows: [], rowCount: deleteManyResult.deletedCount };
+          break;
+
+        case 'aggregate':
+          const aggCursor = collection.aggregate(params.pipeline || []);
+          const aggDocs = await aggCursor.toArray();
+          result = { rows: aggDocs, rowCount: aggDocs.length };
+          break;
+
+        case 'count':
+          const count = await collection.countDocuments(filter);
+          result = { rows: [{ count }], rowCount: 1 };
+          break;
+
+        case 'listCollections':
+          const collections = await db.listCollections().toArray();
+          result = { rows: collections.map(c => ({ name: c.name })), rowCount: collections.length };
+          break;
+
+        case 'createCollection':
+          await db.createCollection(params.name);
+          result = { rows: [], rowCount: 0, created: true };
+          break;
+
+        case 'createIndex':
+          const indexName = await collection.createIndex(params.keys, { unique: params.unique, name: params.name });
+          result = { rows: [{ indexName }], rowCount: 1 };
+          break;
+
+        default:
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Unknown operation: ${operation}` }));
+          return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+      return;
+    }
+
+    // MongoDB-specific endpoints for backwards compatibility
     if (url.pathname === '/find') {
-      const cursor = collection.find(body.filter || {}, {
+      const cursor = collection.find(parseObjectIds(body.filter || {}), {
         projection: body.projection,
         sort: body.sort,
         limit: body.limit,
@@ -105,16 +240,16 @@ const server = createServer(async (req, res) => {
       });
       const documents = await cursor.toArray();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ documents }));
+      res.end(JSON.stringify({ documents, rows: documents, rowCount: documents.length }));
       return;
     }
 
     if (url.pathname === '/findOne') {
-      const document = await collection.findOne(body.filter || {}, {
+      const document = await collection.findOne(parseObjectIds(body.filter || {}), {
         projection: body.projection,
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ document }));
+      res.end(JSON.stringify({ document, rows: document ? [document] : [], rowCount: document ? 1 : 0 }));
       return;
     }
 
@@ -125,6 +260,7 @@ const server = createServer(async (req, res) => {
         acknowledged: result.acknowledged,
         insertedId: result.insertedId?.toString(),
         insertedCount: 1,
+        rowCount: 1,
       }));
       return;
     }
@@ -135,13 +271,14 @@ const server = createServer(async (req, res) => {
       res.end(JSON.stringify({
         acknowledged: result.acknowledged,
         insertedCount: result.insertedCount,
+        rowCount: result.insertedCount,
       }));
       return;
     }
 
     if (url.pathname === '/updateOne') {
       const result = await collection.updateOne(
-        body.filter || {},
+        parseObjectIds(body.filter || {}),
         body.update,
         { upsert: body.upsert }
       );
@@ -152,13 +289,14 @@ const server = createServer(async (req, res) => {
         modifiedCount: result.modifiedCount,
         upsertedCount: result.upsertedCount,
         upsertedId: result.upsertedId?.toString(),
+        rowCount: result.modifiedCount,
       }));
       return;
     }
 
     if (url.pathname === '/updateMany') {
       const result = await collection.updateMany(
-        body.filter || {},
+        parseObjectIds(body.filter || {}),
         body.update,
         { upsert: body.upsert }
       );
@@ -168,26 +306,29 @@ const server = createServer(async (req, res) => {
         matchedCount: result.matchedCount,
         modifiedCount: result.modifiedCount,
         upsertedCount: result.upsertedCount,
+        rowCount: result.modifiedCount,
       }));
       return;
     }
 
     if (url.pathname === '/deleteOne') {
-      const result = await collection.deleteOne(body.filter || {});
+      const result = await collection.deleteOne(parseObjectIds(body.filter || {}));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         acknowledged: result.acknowledged,
         deletedCount: result.deletedCount,
+        rowCount: result.deletedCount,
       }));
       return;
     }
 
     if (url.pathname === '/deleteMany') {
-      const result = await collection.deleteMany(body.filter || {});
+      const result = await collection.deleteMany(parseObjectIds(body.filter || {}));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         acknowledged: result.acknowledged,
         deletedCount: result.deletedCount,
+        rowCount: result.deletedCount,
       }));
       return;
     }
@@ -196,14 +337,14 @@ const server = createServer(async (req, res) => {
       const cursor = collection.aggregate(body.pipeline || []);
       const documents = await cursor.toArray();
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ documents }));
+      res.end(JSON.stringify({ documents, rows: documents, rowCount: documents.length }));
       return;
     }
 
     if (url.pathname === '/count') {
-      const count = await collection.countDocuments(body.filter || {});
+      const count = await collection.countDocuments(parseObjectIds(body.filter || {}));
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ count }));
+      res.end(JSON.stringify({ count, rows: [{ count }], rowCount: 1 }));
       return;
     }
 
@@ -222,6 +363,8 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         collections: collections.map(c => c.name),
+        rows: collections.map(c => ({ name: c.name })),
+        rowCount: collections.length,
       }));
       return;
     }

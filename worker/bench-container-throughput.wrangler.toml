@@ -5,7 +5,7 @@
 #
 # @see https://developers.cloudflare.com/containers/
 
-name = "bench-container-throughput"
+name = "bench-container-throughput-v2"
 main = "bench-container-throughput.ts"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
@@ -13,16 +13,9 @@ compatibility_flags = ["nodejs_compat"]
 # Workers settings
 account_id = "b6641681fe423910342b9ffa1364c76d"
 
-# Build is handled by wrangler automatically
-
 # Performance settings for benchmark worker
 [limits]
 cpu_ms = 300000  # 5 minutes max CPU time for long benchmarks
-
-# Routes
-# routes = [
-#   { pattern = "bench-throughput.example.com/*", zone_name = "example.com" }
-# ]
 
 # Observability
 [observability]
@@ -30,93 +23,91 @@ enabled = true
 head_sampling_rate = 1  # Full sampling during benchmarks
 
 # =============================================================================
+# Container Bindings
+# =============================================================================
+# Each container runs a database with an HTTP bridge for communication.
+#
+# Size tiers:
+# - lite:           256MB RAM, 0.25 vCPU - $0.0025/hr
+# - basic:          512MB RAM, 0.5 vCPU  - $0.005/hr
+# - standard-1:     1GB RAM, 1 vCPU      - $0.01/hr
+# - standard-2:     2GB RAM, 2 vCPU      - $0.02/hr
+# - standard-4:     4GB RAM, 4 vCPU      - $0.04/hr
+# - performance-8:  8GB RAM, 8 vCPU      - $0.08/hr
+# - performance-16: 16GB RAM, 16 vCPU    - $0.16/hr
+# =============================================================================
+
+# PostgreSQL Container
+[[containers]]
+class_name = "PostgresBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.postgres"
+instance_type = "standard-2"
+max_instances = 2
+
+# ClickHouse Container
+[[containers]]
+class_name = "ClickHouseBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.clickhouse"
+instance_type = "standard-2"
+max_instances = 2
+
+# MongoDB Container
+[[containers]]
+class_name = "MongoBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.mongo"
+instance_type = "standard-2"
+max_instances = 2
+
+# DuckDB Container
+[[containers]]
+class_name = "DuckDBBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.duckdb"
+instance_type = "standard-1"
+max_instances = 2
+
+# SQLite Container
+[[containers]]
+class_name = "SQLiteBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.sqlite"
+instance_type = "standard-1"
+max_instances = 2
+
+# =============================================================================
 # Durable Object Bindings
 # =============================================================================
-# Durable Objects manage container lifecycle and provide simulated mode
-# when real Cloudflare Containers are not available.
+# Durable Objects provide the interface for Worker-to-Container communication.
 # =============================================================================
 
 [[durable_objects.bindings]]
 name = "POSTGRES_DO"
-class_name = "PostgresContainerDO"
+class_name = "PostgresBenchContainer"
 
 [[durable_objects.bindings]]
 name = "CLICKHOUSE_DO"
-class_name = "ClickHouseContainerDO"
+class_name = "ClickHouseBenchContainer"
 
 [[durable_objects.bindings]]
 name = "MONGO_DO"
-class_name = "MongoContainerDO"
+class_name = "MongoBenchContainer"
 
 [[durable_objects.bindings]]
 name = "DUCKDB_DO"
-class_name = "DuckDBContainerDO"
+class_name = "DuckDBBenchContainer"
 
 [[durable_objects.bindings]]
 name = "SQLITE_DO"
-class_name = "SQLiteContainerDO"
+class_name = "SQLiteBenchContainer"
 
-# Durable Object migrations
+# =============================================================================
+# Migrations
+# =============================================================================
+# Containers require new_sqlite_classes for SQLite storage used by the
+# Container runtime for state management.
+# =============================================================================
+
 [[migrations]]
 tag = "v1"
-new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO", "DuckDBContainerDO", "SQLiteContainerDO"]
-
-# =============================================================================
-# Container Bindings
-# =============================================================================
-#
-# Size can be configured per-deployment:
-# lite:         256MB RAM, 0.25 vCPU - $0.0025/hr
-# basic:        512MB RAM, 0.5 vCPU  - $0.005/hr
-# standard-1:   1GB RAM, 1 vCPU      - $0.01/hr
-# standard-2:   2GB RAM, 2 vCPU      - $0.02/hr
-# standard-4:   4GB RAM, 4 vCPU      - $0.04/hr
-# performance-8:  8GB RAM, 8 vCPU    - $0.08/hr
-# performance-16: 16GB RAM, 16 vCPU  - $0.16/hr
-#
-# NOTE: Container bindings below are placeholders. When Cloudflare Containers
-# become available, uncomment these sections. Until then, use the Durable Object
-# based simulated mode for benchmarking.
-# =============================================================================
-
-# =============================================================================
-# Container Bindings (Placeholder)
-# =============================================================================
-# NOTE: Cloudflare Containers syntax may differ when officially released.
-# These bindings are placeholders. The Durable Object classes above provide
-# simulated container behavior for benchmarking until real containers are available.
-#
-# When Cloudflare Containers become available, uncomment and update these:
-#
-# [[containers]]
-# binding = "POSTGRES_CONTAINER"
-# class_name = "PostgresContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.postgres"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "CLICKHOUSE_CONTAINER"
-# class_name = "ClickHouseContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.clickhouse"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "MONGO_CONTAINER"
-# class_name = "MongoContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.mongo"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "DUCKDB_CONTAINER"
-# class_name = "DuckDBContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.duckdb"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "SQLITE_CONTAINER"
-# class_name = "SQLiteContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.sqlite"
-# max_instances = 10
+new_sqlite_classes = ["PostgresBenchContainer", "ClickHouseBenchContainer", "MongoBenchContainer", "DuckDBBenchContainer", "SQLiteBenchContainer"]
 
 # =============================================================================
 # R2 Bucket for Results

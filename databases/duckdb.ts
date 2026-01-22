@@ -66,6 +66,7 @@ export async function createDuckDBStore(): Promise<DuckDBStore> {
     AsyncDuckDB: new (logger: unknown, worker: Worker) => unknown
   }
   try {
+    // @ts-expect-error Optional dependency - may not be installed
     duckdb = await import('@duckdb/duckdb-wasm')
   } catch {
     throw new Error(

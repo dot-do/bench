@@ -1,6 +1,7 @@
 # DuckDB Container for Cloudflare Containers
 # Custom container with DuckDB CLI and HTTP bridge
-FROM alpine:3.19
+# Designed for linux/amd64 architecture
+FROM --platform=linux/amd64 alpine:3.19
 
 # Install dependencies
 RUN apk add --no-cache \
@@ -10,7 +11,7 @@ RUN apk add --no-cache \
     wget \
     unzip
 
-# Install DuckDB
+# Install DuckDB CLI
 RUN wget https://github.com/duckdb/duckdb/releases/download/v1.0.0/duckdb_cli-linux-amd64.zip \
     && unzip duckdb_cli-linux-amd64.zip \
     && mv duckdb /usr/local/bin/ \
@@ -39,25 +40,45 @@ RUN cat > /app/server.mjs << 'EOF'
 import { createServer } from 'http';
 import duckdb from 'duckdb';
 
-const db = new duckdb.Database(':memory:');
+// Database instance - can be memory or file-based
+const DB_PATH = process.env.DUCKDB_PATH || ':memory:';
+const db = new duckdb.Database(DB_PATH);
 const conn = db.connect();
 
 // Promisify DuckDB methods
-function query(sql) {
+function query(sql, params = []) {
   return new Promise((resolve, reject) => {
-    conn.all(sql, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+    if (params && params.length > 0) {
+      const stmt = conn.prepare(sql);
+      stmt.all(...params, (err, rows) => {
+        stmt.finalize();
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    } else {
+      conn.all(sql, (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    }
   });
 }
 
-function run(sql) {
+function run(sql, params = []) {
   return new Promise((resolve, reject) => {
-    conn.run(sql, (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
+    if (params && params.length > 0) {
+      const stmt = conn.prepare(sql);
+      stmt.run(...params, (err) => {
+        stmt.finalize();
+        if (err) reject(err);
+        else resolve();
+      });
+    } else {
+      conn.run(sql, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    }
   });
 }
 
@@ -101,15 +122,30 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const body = await new Promise((resolve) => {
+    const body = await new Promise((resolve, reject) => {
       let data = '';
       req.on('data', chunk => data += chunk);
-      req.on('end', () => resolve(JSON.parse(data || '{}')));
+      req.on('end', () => {
+        try {
+          resolve(JSON.parse(data || '{}'));
+        } catch (e) {
+          reject(new Error('Invalid JSON body'));
+        }
+      });
+      req.on('error', reject);
     });
 
     if (url.pathname === '/query') {
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+
       const startTime = performance.now();
-      const rows = await query(body.query);
+      const rows = await query(sql, body.params || []);
       const time = (performance.now() - startTime) / 1000;
 
       // Get column info if available
@@ -128,9 +164,41 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/execute') {
-      await run(body.query);
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+
+      await run(sql, body.params || []);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ rowsAffected: 0 }));
+      res.end(JSON.stringify({ success: true, rowsAffected: 0 }));
+      return;
+    }
+
+    if (url.pathname === '/batch') {
+      const statements = body.statements || [];
+      const results = [];
+
+      for (const stmt of statements) {
+        const sql = stmt.sql || stmt.query;
+        if (!sql) continue;
+
+        const startTime = performance.now();
+        const rows = await query(sql, stmt.params || []);
+        const time = (performance.now() - startTime) / 1000;
+
+        results.push({
+          rows,
+          rowCount: rows.length,
+          time,
+        });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(results));
       return;
     }
 
@@ -143,19 +211,22 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(9999, '0.0.0.0', () => {
-  console.log('DuckDB HTTP bridge listening on port 9999');
+server.listen(8080, '0.0.0.0', () => {
+  console.log('DuckDB HTTP bridge listening on port 8080');
 });
 EOF
 
-# Create data directory
+# Create data directory for persistent databases
 RUN mkdir -p /data
 
+# Environment variables
+ENV DUCKDB_PATH=:memory:
+
 # Expose HTTP bridge port
-EXPOSE 9999
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=5s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:9999/health || exit 1
+  CMD curl -f http://localhost:8080/health || exit 1
 
 CMD ["node", "/app/server.mjs"]

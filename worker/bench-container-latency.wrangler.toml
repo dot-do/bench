@@ -6,7 +6,7 @@
 #
 # Deploy: wrangler deploy -c worker/bench-container-latency.wrangler.toml
 
-name = "bench-container-latency"
+name = "bench-container-latency-v2"
 account_id = "b6641681fe423910342b9ffa1364c76d"
 main = "bench-container-latency.ts"
 compatibility_date = "2025-01-21"
@@ -31,38 +31,6 @@ bucket_name = "bench-results"
 preview_bucket_name = "bench-results-preview"
 
 # ==============================================================================
-# Durable Object Bindings
-# ==============================================================================
-# Durable Objects manage container lifecycle and provide simulated mode
-# when real Cloudflare Containers are not available.
-# ==============================================================================
-
-[[durable_objects.bindings]]
-name = "POSTGRES_DO"
-class_name = "PostgresContainerDO"
-
-[[durable_objects.bindings]]
-name = "CLICKHOUSE_DO"
-class_name = "ClickHouseContainerDO"
-
-[[durable_objects.bindings]]
-name = "MONGO_DO"
-class_name = "MongoContainerDO"
-
-[[durable_objects.bindings]]
-name = "DUCKDB_DO"
-class_name = "DuckDBContainerDO"
-
-[[durable_objects.bindings]]
-name = "SQLITE_DO"
-class_name = "SQLiteContainerDO"
-
-# Durable Object migrations
-[[migrations]]
-tag = "v1"
-new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO", "DuckDBContainerDO", "SQLiteContainerDO"]
-
-# ==============================================================================
 # Container Bindings
 # ==============================================================================
 # Each container runs a database with an HTTP bridge for communication.
@@ -76,50 +44,79 @@ new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO
 # - standard-4:     4GB RAM, 4 vCPU ($0.24/hr)
 # - performance-8:  8GB RAM, 8 vCPU ($0.48/hr)
 # - performance-16: 16GB RAM, 16 vCPU ($0.96/hr)
-#
-# NOTE: Container bindings below are placeholders. When Cloudflare Containers
-# become available, uncomment these sections. Until then, use the Durable Object
-# based simulated mode for benchmarking.
 # ==============================================================================
 
+# PostgreSQL Container
+[[containers]]
+class_name = "PostgresBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.postgres"
+instance_type = "standard-2"
+max_instances = 2
+
+# ClickHouse Container
+[[containers]]
+class_name = "ClickHouseBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.clickhouse"
+instance_type = "standard-2"
+max_instances = 2
+
+# MongoDB Container
+[[containers]]
+class_name = "MongoBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.mongo"
+instance_type = "standard-2"
+max_instances = 2
+
+# DuckDB Container
+[[containers]]
+class_name = "DuckDBBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.duckdb"
+instance_type = "standard-1"
+max_instances = 2
+
+# SQLite Container
+[[containers]]
+class_name = "SQLiteBenchContainer"
+image = "../containers/dockerfiles/Dockerfile.sqlite"
+instance_type = "standard-1"
+max_instances = 2
+
 # ==============================================================================
-# Container Bindings (Placeholder)
+# Durable Object Bindings
 # ==============================================================================
-# NOTE: Cloudflare Containers syntax may differ when officially released.
-# These bindings are placeholders. The Durable Object classes above provide
-# simulated container behavior for benchmarking until real containers are available.
-#
-# When Cloudflare Containers become available, uncomment and update these:
-#
-# [[containers]]
-# binding = "POSTGRES_CONTAINER"
-# class_name = "PostgresContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.postgres"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "CLICKHOUSE_CONTAINER"
-# class_name = "ClickHouseContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.clickhouse"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "MONGO_CONTAINER"
-# class_name = "MongoContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.mongo"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "DUCKDB_CONTAINER"
-# class_name = "DuckDBContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.duckdb"
-# max_instances = 10
-#
-# [[containers]]
-# binding = "SQLITE_CONTAINER"
-# class_name = "SQLiteContainerDO"
-# image = "../containers/dockerfiles/Dockerfile.sqlite"
-# max_instances = 10
+# Durable Objects provide the interface for Worker-to-Container communication.
+# ==============================================================================
+
+[[durable_objects.bindings]]
+name = "POSTGRES_DO"
+class_name = "PostgresBenchContainer"
+
+[[durable_objects.bindings]]
+name = "CLICKHOUSE_DO"
+class_name = "ClickHouseBenchContainer"
+
+[[durable_objects.bindings]]
+name = "MONGO_DO"
+class_name = "MongoBenchContainer"
+
+[[durable_objects.bindings]]
+name = "DUCKDB_DO"
+class_name = "DuckDBBenchContainer"
+
+[[durable_objects.bindings]]
+name = "SQLITE_DO"
+class_name = "SQLiteBenchContainer"
+
+# ==============================================================================
+# Migrations
+# ==============================================================================
+# Containers require new_sqlite_classes for SQLite storage used by the
+# Container runtime for state management.
+# ==============================================================================
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PostgresBenchContainer", "ClickHouseBenchContainer", "MongoBenchContainer", "DuckDBBenchContainer", "SQLiteBenchContainer"]
 
 # ==============================================================================
 # Environment-specific configurations
@@ -127,7 +124,7 @@ new_classes = ["PostgresContainerDO", "ClickHouseContainerDO", "MongoContainerDO
 
 # Production environment
 [env.production]
-name = "bench-container-latency"
+name = "bench-container-latency-v2"
 route = { pattern = "bench.dotdo.workers.dev/benchmark/container-latency*", zone_name = "dotdo.workers.dev" }
 
 [[env.production.r2_buckets]]
@@ -152,12 +149,6 @@ enabled = true
 [observability.logs]
 enabled = true
 invocation_logs = true
-
-# ==============================================================================
-# Build configuration
-# ==============================================================================
-
-# Build is handled by wrangler automatically
 
 # ==============================================================================
 # Placement (optional - for specific region targeting)

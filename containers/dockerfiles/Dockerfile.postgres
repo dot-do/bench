@@ -1,6 +1,7 @@
 # PostgreSQL Container for Cloudflare Containers
 # Includes HTTP bridge for Worker communication
-FROM postgres:16-alpine
+# Designed for linux/amd64 architecture
+FROM --platform=linux/amd64 postgres:16-alpine
 
 # Install dependencies for HTTP bridge
 RUN apk add --no-cache \
@@ -93,7 +94,14 @@ const server = createServer(async (req, res) => {
     });
 
     if (url.pathname === '/query') {
-      const result = await pool.query(body.query, body.params || []);
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+      const result = await pool.query(sql, body.params || []);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         rows: result.rows,
@@ -107,7 +115,14 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname === '/execute') {
-      const result = await pool.query(body.query, body.params || []);
+      // Support both 'sql' and 'query' for backwards compatibility
+      const sql = body.sql || body.query;
+      if (!sql) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
+        return;
+      }
+      const result = await pool.query(sql, body.params || []);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ rowsAffected: result.rowCount || 0 }));
       return;
