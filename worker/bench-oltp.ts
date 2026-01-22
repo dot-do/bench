@@ -58,6 +58,12 @@ const BENCHMARK_CONFIG = {
     update: 100,
     delete: 50,
     transaction: 20,
+    // Stress test operations - fewer iterations since each is expensive
+    fullscan: 10,
+    aggregatecount: 10,
+    aggregatesum: 10,
+    complexfilter: 10,
+    sortall: 5,
   },
   batchSizes: {
     small: 10,
@@ -85,6 +91,12 @@ type OLTPOperation =
   | 'update'
   | 'delete'
   | 'transaction'
+  // Stress test operations
+  | 'full_scan'
+  | 'aggregate_count'
+  | 'aggregate_sum'
+  | 'complex_filter'
+  | 'sort_all'
 
 // ============================================================================
 // Types
@@ -848,11 +860,28 @@ export class OLTPBenchDO extends DurableObject<Env> {
       await this.executeOperation(operation, collection, ids)
     }
 
-    // Benchmark
-    for (let i = 0; i < iterations; i++) {
-      const start = performance.now()
-      await this.executeOperation(operation, collection, ids)
-      times.push(performance.now() - start)
+    // Benchmark - time entire batch, force clock tick with real I/O
+    const BATCH_SIZE = 100 // Batch many ops together to get measurable time
+    const numBatches = Math.max(1, Math.floor(iterations / BATCH_SIZE))
+
+    for (let batch = 0; batch < numBatches; batch++) {
+      // Force clock to tick with minimal I/O (HEAD request is fast)
+      await fetch('https://1.1.1.1/cdn-cgi/trace', { method: 'HEAD' }).catch(() => {})
+      const batchStart = performance.now()
+
+      for (let i = 0; i < BATCH_SIZE; i++) {
+        await this.executeOperation(operation, collection, ids)
+      }
+
+      // Force clock to tick after batch with I/O
+      await fetch('https://1.1.1.1/cdn-cgi/trace', { method: 'HEAD' }).catch(() => {})
+      const batchTime = performance.now() - batchStart
+      const timePerOp = batchTime / BATCH_SIZE
+
+      // Record per-op time for this batch
+      for (let i = 0; i < BATCH_SIZE; i++) {
+        times.push(timePerOp)
+      }
     }
 
     const stats = calculateStats(times)
@@ -862,7 +891,7 @@ export class OLTPBenchDO extends DurableObject<Env> {
       name: operation,
       iterations: effectiveIterations,
       ...stats,
-      opsPerSec: effectiveIterations / (stats.totalMs / 1000),
+      opsPerSec: stats.totalMs > 0 ? effectiveIterations / (stats.totalMs / 1000) : null,
     }
   }
 
@@ -956,6 +985,70 @@ export class OLTPBenchDO extends DurableObject<Env> {
           })
         })
         break
+
+      // Stress test operations - these should take measurable time
+      case 'full_scan': {
+        // Scan ALL records without limit - forces iteration through entire dataset
+        const allDocs = await this.adapter!.rangeScan(collection, {}, 1000000)
+        // Force iteration through results to prevent lazy evaluation
+        let count = 0
+        for (const doc of allDocs) {
+          if (doc.id) count++
+        }
+        void count // prevent optimization
+        break
+      }
+
+      case 'aggregate_count': {
+        // Scan all and count matching criteria
+        const docs = await this.adapter!.rangeScan(collection, {}, 1000000)
+        let activeCount = 0
+        let pendingCount = 0
+        for (const doc of docs) {
+          if (doc.status === 'active') activeCount++
+          if (doc.status === 'pending') pendingCount++
+        }
+        void (activeCount + pendingCount)
+        break
+      }
+
+      case 'aggregate_sum': {
+        // Scan all and sum numeric fields
+        const docs = await this.adapter!.rangeScan(collection, {}, 1000000)
+        let total = 0
+        for (const doc of docs) {
+          if (typeof doc.amount === 'number') total += doc.amount
+          if (typeof doc.price === 'number') total += doc.price
+          if (typeof doc.quantity === 'number') total += doc.quantity
+        }
+        void total
+        break
+      }
+
+      case 'complex_filter': {
+        // Multi-condition filter requiring full scan and evaluation
+        const docs = await this.adapter!.rangeScan(collection, {}, 1000000)
+        const filtered = docs.filter(doc => {
+          const hasStatus = doc.status === 'active' || doc.status === 'completed'
+          const hasDate = doc.created_at && doc.created_at > '2024-01-01'
+          const hasAmount = typeof doc.amount === 'number' && doc.amount > 100
+          return hasStatus && hasDate && hasAmount
+        })
+        void filtered.length
+        break
+      }
+
+      case 'sort_all': {
+        // Scan all and sort - memory and CPU intensive
+        const docs = await this.adapter!.rangeScan(collection, {}, 1000000)
+        const sorted = [...docs].sort((a, b) => {
+          const aDate = String(a.created_at ?? '')
+          const bDate = String(b.created_at ?? '')
+          return bDate.localeCompare(aDate) // descending
+        })
+        void sorted.length
+        break
+      }
     }
   }
 
@@ -1059,6 +1152,27 @@ export class OLTPBenchDO extends DurableObject<Env> {
 
 const app = new Hono<{ Bindings: Env }>()
 
+// Root endpoint - API documentation
+app.get('/', (c) => {
+  return c.json({
+    service: 'bench-oltp',
+    description: 'OLTP Benchmark Worker - stress test database operations',
+    endpoints: {
+      'GET /benchmark/oltp/:database/:dataset/:size': 'Run benchmarks (e.g., /benchmark/oltp/db4/ecommerce/100mb)',
+      'GET /benchmark/oltp/options': 'List available options',
+      'GET /health': 'Health check',
+    },
+    examples: [
+      '/benchmark/oltp/db4/ecommerce/100mb',
+      '/benchmark/oltp/sqlite/ecommerce/10mb',
+      '/benchmark/oltp/db4-mongo/saas/100mb',
+    ],
+    databases: ['db4', 'evodb', 'postgres', 'sqlite', 'db4-mongo', 'dotdo-mongodb', 'sdb'],
+    datasets: ['ecommerce', 'saas', 'social'],
+    sizes: ['1mb', '10mb', '100mb', '1gb'],
+  })
+})
+
 // Health check
 app.get('/health', (c) => {
   return c.json({ status: 'ok', service: 'bench-oltp', timestamp: new Date().toISOString() })
@@ -1078,11 +1192,91 @@ app.get('/benchmark/oltp/options', (c) => {
       'update',
       'delete',
       'transaction',
+      // Stress test operations
+      'full_scan',
+      'aggregate_count',
+      'aggregate_sum',
+      'complex_filter',
+      'sort_all',
     ],
   })
 })
 
-// Main benchmark endpoint
+// RESTful GET endpoint: /benchmark/oltp/:database/:dataset/:size
+// Example: /benchmark/oltp/db4/ecommerce/100mb
+app.get('/benchmark/oltp/:database/:dataset/:size', async (c) => {
+  const database = c.req.param('database') as DatabaseType
+  const dataset = c.req.param('dataset') as DatasetType
+  const size = c.req.param('size') as SizeType
+
+  // Validate inputs
+  const validDatabases: DatabaseType[] = ['db4', 'evodb', 'postgres', 'sqlite', 'db4-mongo', 'dotdo-mongodb', 'sdb']
+  const validDatasets: DatasetType[] = ['ecommerce', 'saas', 'social']
+  const validSizes: SizeType[] = ['1mb', '10mb', '100mb', '1gb']
+
+  if (!validDatabases.includes(database)) {
+    return c.json({ error: `Invalid database. Valid options: ${validDatabases.join(', ')}` }, 400)
+  }
+
+  if (!validDatasets.includes(dataset)) {
+    return c.json({ error: `Invalid dataset. Valid options: ${validDatasets.join(', ')}` }, 400)
+  }
+
+  if (!validSizes.includes(size)) {
+    return c.json({ error: `Invalid size. Valid options: ${validSizes.join(', ')}` }, 400)
+  }
+
+  try {
+    // Get the appropriate DO namespace
+    const doNamespaceMap: Record<DatabaseType, DurableObjectNamespace<OLTPBenchDO>> = {
+      db4: c.env.DB4_DO,
+      evodb: c.env.EVODB_DO,
+      postgres: c.env.POSTGRES_DO,
+      sqlite: c.env.SQLITE_DO,
+      'db4-mongo': c.env.DB4_MONGO_DO,
+      'dotdo-mongodb': c.env.DOTDO_MONGODB_DO,
+      sdb: c.env.SDB_DO,
+    }
+
+    const doNamespace = doNamespaceMap[database]
+    if (!doNamespace) {
+      return c.json({ error: `DO namespace not configured for database: ${database}` }, 500)
+    }
+
+    const doId = doNamespace.idFromName(`oltp-${database}-${dataset}-${size}-${Date.now()}`)
+    const benchDO = doNamespace.get(doId)
+
+    const benchmarkRequest: BenchmarkRequest = {
+      database,
+      dataset,
+      size,
+      // Default to stress test operations for meaningful benchmarks
+      operations: ['full_scan', 'aggregate_count', 'aggregate_sum', 'complex_filter', 'sort_all'],
+      iterations: 10,
+    }
+
+    const doRequest = new Request('http://internal/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(benchmarkRequest),
+    })
+
+    const response = await benchDO.fetch(doRequest)
+    const results = (await response.json()) as OLTPBenchmarkResults
+
+    // Add colo info
+    results.colo = (c.req.raw as { cf?: { colo?: string } }).cf?.colo ?? 'unknown'
+
+    return c.json(results)
+  } catch (error) {
+    return c.json(
+      { error: error instanceof Error ? error.message : 'Unknown error' },
+      500
+    )
+  }
+})
+
+// Legacy POST endpoint (for backward compatibility)
 app.post('/benchmark/oltp', async (c) => {
   const database = (c.req.query('database') || 'db4') as DatabaseType
   const dataset = (c.req.query('dataset') || 'ecommerce') as DatasetType
