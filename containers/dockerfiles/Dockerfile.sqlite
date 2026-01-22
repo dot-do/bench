@@ -51,6 +51,56 @@ function getDatabase(dbPath) {
   return databases.get(key);
 }
 
+/**
+ * Convert PostgreSQL-style $1, $2 placeholders to SQLite ? placeholders.
+ * This allows the bridge to accept queries written for PostgreSQL.
+ * better-sqlite3 expects ? for positional parameters when passed as an array.
+ * @param {string} sql - SQL with $1, $2, etc. placeholders
+ * @param {Array} params - Parameter values array
+ * @returns {{sql: string, params: Array}} - SQL with ? placeholders and reordered params
+ */
+function convertPlaceholders(sql, params) {
+  if (!params || params.length === 0) {
+    return { sql, params: params || [] };
+  }
+
+  // Find all $N placeholders
+  const regex = /\$(\d+)/g;
+  const matches = [];
+  let match;
+  while ((match = regex.exec(sql)) !== null) {
+    matches.push({ index: parseInt(match[1], 10), pos: match.index, len: match[0].length });
+  }
+
+  // If no placeholders found, return original SQL
+  if (matches.length === 0) {
+    return { sql, params };
+  }
+
+  // Build the new SQL with ? placeholders and reorder params
+  // Sort matches by position for replacement
+  matches.sort((a, b) => a.pos - b.pos);
+
+  let result = '';
+  let lastPos = 0;
+  const newParams = [];
+
+  for (const m of matches) {
+    result += sql.slice(lastPos, m.pos) + '?';
+    lastPos = m.pos + m.len;
+    // $1 corresponds to params[0], $2 to params[1], etc.
+    const paramIndex = m.index - 1;
+    if (paramIndex >= 0 && paramIndex < params.length) {
+      newParams.push(params[paramIndex]);
+    } else {
+      newParams.push(null); // Fallback for out-of-bounds
+    }
+  }
+  result += sql.slice(lastPos);
+
+  return { sql: result, params: newParams };
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -110,12 +160,17 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === '/query') {
       // Support both 'sql' and 'query' for backwards compatibility
-      const sql = body.sql || body.query;
+      let sql = body.sql || body.query;
       if (!sql) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
         return;
       }
+
+      // Convert $1, $2 placeholders to ? for better-sqlite3 compatibility
+      const converted = convertPlaceholders(sql, body.params || []);
+      sql = converted.sql;
+      const params = converted.params;
 
       const stmt = db.prepare(sql);
       const isSelect = sql.trim().toUpperCase().startsWith('SELECT') ||
@@ -123,7 +178,7 @@ const server = createServer(async (req, res) => {
                        sql.trim().toUpperCase().startsWith('EXPLAIN');
 
       if (isSelect) {
-        const rows = stmt.all(...(body.params || []));
+        const rows = stmt.all(...params);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           rows,
@@ -133,7 +188,7 @@ const server = createServer(async (req, res) => {
           changes: 0,
         }));
       } else {
-        const result = stmt.run(...(body.params || []));
+        const result = stmt.run(...params);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           rows: [],
@@ -148,15 +203,20 @@ const server = createServer(async (req, res) => {
 
     if (url.pathname === '/execute') {
       // Support both 'sql' and 'query' for backwards compatibility
-      const sql = body.sql || body.query;
+      let sql = body.sql || body.query;
       if (!sql) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Missing sql or query parameter' }));
         return;
       }
 
+      // Convert $1, $2 placeholders to ? for better-sqlite3 compatibility
+      const converted = convertPlaceholders(sql, body.params || []);
+      sql = converted.sql;
+      const params = converted.params;
+
       const stmt = db.prepare(sql);
-      const result = stmt.run(...(body.params || []));
+      const result = stmt.run(...params);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
@@ -172,8 +232,13 @@ const server = createServer(async (req, res) => {
 
       const transaction = db.transaction((stmts) => {
         for (const s of stmts) {
-          const sql = s.sql || s.query;
+          let sql = s.sql || s.query;
           if (!sql) continue;
+
+          // Convert $1, $2 placeholders to ? for better-sqlite3 compatibility
+          const converted = convertPlaceholders(sql, s.params || []);
+          sql = converted.sql;
+          const params = converted.params;
 
           const prepared = db.prepare(sql);
           const isSelect = sql.trim().toUpperCase().startsWith('SELECT') ||
@@ -181,7 +246,7 @@ const server = createServer(async (req, res) => {
                            sql.trim().toUpperCase().startsWith('EXPLAIN');
 
           if (isSelect) {
-            const rows = prepared.all(...(s.params || []));
+            const rows = prepared.all(...params);
             results.push({
               rows,
               rowCount: rows.length,
@@ -190,7 +255,7 @@ const server = createServer(async (req, res) => {
               changes: 0,
             });
           } else {
-            const result = prepared.run(...(s.params || []));
+            const result = prepared.run(...params);
             results.push({
               rows: [],
               rowCount: 0,
